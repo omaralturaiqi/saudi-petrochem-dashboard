@@ -1,0 +1,9 @@
+# Dependencies for ingestion/parser.py only.
+# Deliberately NOT merged into the root requirements.txt, which is what
+# Render's web service build uses (pip install -r requirements.txt) — this
+# keeps the deployed web app's dependency surface minimal and unaffected by
+# ingestion-only tooling, per this phase's "keep dependencies minimal" rule.
+#
+# To run the ingestion pipeline locally:
+#   pip install -r ingestion/requirements-ingestion.txt
+pdfplumber==0.11.9
