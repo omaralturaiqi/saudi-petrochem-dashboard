@@ -1,0 +1,25 @@
+# Secrets — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Local data / raw downloads — this repo tracks code and schema, not the
+# PDF archive or extracted CSVs, which can be large and are reproducible
+# from the ingestion pipeline against official sources
+data/raw/
+data/processed/
+*.db
+*.sqlite
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
