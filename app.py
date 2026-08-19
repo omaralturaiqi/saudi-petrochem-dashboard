@@ -16,8 +16,9 @@ import os
 import logging
 import requests
 from flask import Flask, render_template_string, abort
-
+from us_xbrl_api import us_xbrl_bp
 app = Flask(__name__)
+app.register_blueprint(us_xbrl_bp)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("saudi-petrochem-dashboard")
 
