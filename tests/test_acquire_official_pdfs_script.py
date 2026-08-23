@@ -16,6 +16,7 @@ import io
 import sys
 import unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 import requests
 
@@ -23,7 +24,10 @@ from scripts.acquire_official_pdfs import (
     count_pdf_targets,
     print_summary,
     _summarize_response,
+    _timed_get,
     diagnose_http_investigation,
+    CONTROL_TEST_US_PDF_URL,
+    DIAGNOSTIC_REPORT_PAGE_CANDIDATES,
 )
 
 
@@ -167,6 +171,92 @@ class TestDiagnoseHttpInvestigationNoRegistryEntry(unittest.TestCase):
             result = diagnose_http_investigation("sabic", 1999)
         self.assertEqual(result.get("error"), "no registry entry")
         self.assertNotIn("test_1_default_headers", result)
+        self.assertNotIn("control_test_us_pdf", result)
+
+
+class TestTimedGet(unittest.TestCase):
+    def test_successful_call_returns_response_elapsed_and_no_error(self):
+        fake = _fake_response(status_code=200, content=b"%PDF-...")
+        with patch("requests.get", return_value=fake) as mock_get:
+            resp, elapsed, err = _timed_get("https://example.invalid/x", timeout=30)
+        self.assertIs(resp, fake)
+        self.assertIsNone(err)
+        self.assertGreaterEqual(elapsed, 0)
+        mock_get.assert_called_once_with("https://example.invalid/x", timeout=30)
+
+    def test_exception_returns_none_response_and_error_string(self):
+        with patch("requests.get", side_effect=requests.exceptions.ConnectionError("boom")):
+            resp, elapsed, err = _timed_get("https://example.invalid/x", timeout=30)
+        self.assertIsNone(resp)
+        self.assertIn("ConnectionError", err)
+        self.assertGreaterEqual(elapsed, 0)
+
+
+class TestDiagnoseHttpInvestigationControlTest(unittest.TestCase):
+    """Full flow with requests.get mocked (no real network I/O) to verify
+    the CONTROL TEST — U.S. PDF section runs alongside the two existing
+    SABIC sections, in the required output order, without touching any
+    registry."""
+
+    def _sabic_pdf_url(self):
+        from ingestion.load_historical import COMPANY_SOURCE_REGISTRIES, CONFIRMED_COMPANY_TICKERS
+        ticker = CONFIRMED_COMPANY_TICKERS["sabic"]
+        return COMPANY_SOURCE_REGISTRIES["sabic"][(ticker, 2024)]["source_url"]
+
+    def test_three_named_sections_and_result_keys_present(self):
+        sabic_pdf_url = self._sabic_pdf_url()
+        report_page_url = DIAGNOSTIC_REPORT_PAGE_CANDIDATES["sabic"]
+
+        def fake_get(url, **kwargs):
+            if url == CONTROL_TEST_US_PDF_URL:
+                return _fake_response(status_code=200, content=b"%PDF-1.7 control pdf bytes",
+                                       content_type="application/pdf", url=url)
+            if url == sabic_pdf_url:
+                html = b"<html><head><title>Internal Server Error</title></head><body>500</body></html>"
+                return _fake_response(status_code=500, content=html, content_type="text/html", url=url)
+            if url == report_page_url:
+                html = b"<html><head><title>Annual Report</title></head><body>ok</body></html>"
+                return _fake_response(status_code=200, content=html, content_type="text/html", url=url)
+            raise AssertionError(f"unexpected URL requested in test: {url}")
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_http_investigation("sabic", 2024)
+        output = buf.getvalue()
+
+        self.assertIn("CONTROL TEST — U.S. PDF", output)
+        self.assertIn("SABIC FY2024 PDF", output)
+        self.assertIn("SABIC FY2024 official report/index page", output)
+        # Control section must appear before the SABIC PDF section in output.
+        self.assertLess(output.index("CONTROL TEST — U.S. PDF"), output.index("SABIC FY2024 PDF"))
+
+        self.assertTrue(result["control_test_us_pdf"]["starts_with_pdf_magic"])
+        self.assertEqual(result["control_test_us_pdf"]["http_status"], 200)
+        self.assertEqual(result["test_1_default_headers"]["http_status"], 500)
+        self.assertEqual(result["test_2_browser_headers"]["http_status"], 500)
+        self.assertEqual(result["test_3_report_page"]["http_status"], 200)
+        self.assertIn("elapsed_seconds", result["control_test_us_pdf"])
+
+    def test_control_test_network_failure_does_not_crash_remaining_sections(self):
+        sabic_pdf_url = self._sabic_pdf_url()
+        report_page_url = DIAGNOSTIC_REPORT_PAGE_CANDIDATES["sabic"]
+
+        def fake_get(url, **kwargs):
+            if url == CONTROL_TEST_US_PDF_URL:
+                raise requests.exceptions.ConnectionError("control host unreachable")
+            if url == sabic_pdf_url:
+                return _fake_response(status_code=200, content=b"%PDF-1.7 real sabic pdf", url=url)
+            if url == report_page_url:
+                return _fake_response(status_code=200, content=b"<html></html>", content_type="text/html", url=url)
+            raise AssertionError(f"unexpected URL requested in test: {url}")
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_http_investigation("sabic", 2024)
+        self.assertIn("ConnectionError", result["control_test_us_pdf"]["error"])
+        self.assertTrue(result["test_1_default_headers"]["starts_with_pdf_magic"])
 
 
 class TestScriptDoesNotImportNetworkAtModuleLevel(unittest.TestCase):

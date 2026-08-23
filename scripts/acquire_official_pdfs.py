@@ -238,6 +238,13 @@ BROWSER_LIKE_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Fixed control PDF used ONLY to distinguish "SABIC-specific rejection"
+# from "Render/network cannot fetch ANY PDF at all". Verified via WebSearch
+# as a real, current, official U.S. government PDF (SEC EDGAR Filer Manual,
+# Volume II) — not guessed/pattern-generated, unrelated to any target
+# company, never added to any *_SOURCE_REGISTRY, never downloaded to disk.
+CONTROL_TEST_US_PDF_URL = "https://www.sec.gov/files/edgar/filermanual/efmvol2-c2.pdf"
+
 # Bot-protection / WAF / CDN signal hunting is limited to a fixed, small set
 # of well-known header names and body keywords — no brute forcing, no
 # expanding this list based on trial and error against the live site.
@@ -253,11 +260,13 @@ WAF_SIGNAL_BODY_KEYWORDS = (
 )
 
 
-def _summarize_response(label: str, resp) -> dict:
+def _summarize_response(label: str, resp, elapsed_seconds: float | None = None) -> dict:
     """Common read-only summary for a single requests.Response: status,
     content-type, size, redirect history, final URL, PDF magic bytes, and
     (for HTML bodies only) a short truncated snippet + WAF/CDN header and
-    keyword signals. Never writes the body to disk."""
+    keyword signals. Never writes the body to disk. elapsed_seconds is
+    optional wall-clock timing for the request, supplied by the caller
+    (this function performs no I/O itself, so it can't time anything)."""
     content_type = resp.headers.get("Content-Type", "unknown")
     is_html = "html" in content_type.lower()
     summary = {
@@ -267,12 +276,17 @@ def _summarize_response(label: str, resp) -> dict:
         "response_size_bytes": len(resp.content),
         "final_url": resp.url,
         "redirect_history": [(r.status_code, r.url) for r in resp.history],
+        "redirect_count": len(resp.history),
         "starts_with_pdf_magic": resp.content[:5] == b"%PDF-",
     }
     print(f"  [{label}]")
     print(f"    HTTP status      : {summary['http_status']}")
     print(f"    Content-Type     : {content_type}")
     print(f"    Response size    : {summary['response_size_bytes']} bytes")
+    if elapsed_seconds is not None:
+        summary["elapsed_seconds"] = round(elapsed_seconds, 2)
+        print(f"    Elapsed time     : {summary['elapsed_seconds']}s")
+    print(f"    Redirect count   : {summary['redirect_count']}")
     print(f"    Redirect history : {summary['redirect_history'] or '(none)'}")
     print(f"    Final URL        : {summary['final_url']}")
     print(f"    Starts with %PDF-: {summary['starts_with_pdf_magic']}")
@@ -300,22 +314,40 @@ def _summarize_response(label: str, resp) -> dict:
     return summary
 
 
+def _timed_get(url: str, **kwargs) -> tuple[object | None, float, str | None]:
+    """Single GET with no retries, returning (response_or_None, elapsed_seconds,
+    error_string_or_None). Pure timing/error wrapper — no summarization."""
+    import requests
+
+    t0 = time.monotonic()
+    try:
+        resp = requests.get(url, **kwargs)
+        return resp, time.monotonic() - t0, None
+    except Exception as e:
+        return None, time.monotonic() - t0, f"{type(e).__name__}: {e}"
+
+
 def diagnose_http_investigation(company_slug: str, fiscal_year: int) -> dict:
     """Investigates WHY a registered PDF URL returns something other than a
     real PDF (e.g. HTTP 500 / text/html), without modifying the registry,
-    without retries, without curl, and without saving the HTML body as a
-    file. Makes at most 3 read-only GET requests total:
-      1. The exact registered URL, current requests config (no custom
-         headers) — matches what acquire_one_report() itself sends.
-      2. The exact registered URL, with a normal browser User-Agent/Accept.
-      3. (If a diagnostic report-index page is known for this company) that
-         page, to see whether the *page* is reachable even if the direct
-         PDF link is not.
+    without retries, without curl, and without saving any body to disk.
+    Makes at most 4 read-only GET requests total, reported as three named
+    sections:
+      CONTROL TEST — U.S. PDF
+        A fixed, unrelated, reputable U.S. government PDF (see
+        CONTROL_TEST_US_PDF_URL) — establishes whether Render can fetch
+        ANY real PDF at all, independent of SABIC entirely.
+      SABIC FY2024 PDF
+        1. The exact registered URL, current requests config (no custom
+           headers) — matches what acquire_one_report() itself sends.
+        2. The exact registered URL, with a normal browser User-Agent/Accept.
+      SABIC FY2024 official report/index page
+        3. (If a diagnostic report-index page is known for this company)
+           that page, to see whether the *page* is reachable even if the
+           direct PDF link is not.
     Does NOT call acquire_one_report() — this is HTTP-behavior
     investigation only, separate from the authoritative acquisition path.
     """
-    import requests
-
     registry = COMPANY_SOURCE_REGISTRIES[company_slug]
     ticker = CONFIRMED_COMPANY_TICKERS[company_slug]
     key = (ticker, fiscal_year)
@@ -335,62 +367,91 @@ def diagnose_http_investigation(company_slug: str, fiscal_year: int) -> dict:
     print(f"Registered URL: {url}")
     print()
 
-    print("TEST 1 — exact URL, current requests config (no custom headers):")
-    try:
-        resp1 = requests.get(url, timeout=30)
-        result["test_1_default_headers"] = _summarize_response("default headers", resp1)
-    except Exception as e:
-        result["test_1_default_headers"] = {"error": f"{type(e).__name__}: {e}"}
-        print(f"  REQUEST FAILED: {result['test_1_default_headers']['error']}")
+    # --- CONTROL TEST — U.S. PDF --------------------------------------------
+    print("CONTROL TEST — U.S. PDF")
+    print(f"  {CONTROL_TEST_US_PDF_URL}")
+    resp, elapsed, err = _timed_get(CONTROL_TEST_US_PDF_URL, timeout=30, headers=BROWSER_LIKE_HEADERS)
+    if resp is not None:
+        result["control_test_us_pdf"] = _summarize_response("U.S. control PDF", resp, elapsed)
+    else:
+        result["control_test_us_pdf"] = {"error": err, "elapsed_seconds": round(elapsed, 2)}
+        print(f"  REQUEST FAILED after {round(elapsed, 2)}s: {err}")
     print()
 
-    print("TEST 2 — exact URL, normal browser-like User-Agent + Accept headers:")
-    try:
-        resp2 = requests.get(url, timeout=30, headers=BROWSER_LIKE_HEADERS)
-        result["test_2_browser_headers"] = _summarize_response("browser-like headers", resp2)
-    except Exception as e:
-        result["test_2_browser_headers"] = {"error": f"{type(e).__name__}: {e}"}
-        print(f"  REQUEST FAILED: {result['test_2_browser_headers']['error']}")
+    # --- SABIC FY2024 PDF ----------------------------------------------------
+    print("SABIC FY2024 PDF")
+    print("  TEST 1 — exact URL, current requests config (no custom headers):")
+    resp, elapsed, err = _timed_get(url, timeout=30)
+    if resp is not None:
+        result["test_1_default_headers"] = _summarize_response("default headers", resp, elapsed)
+    else:
+        result["test_1_default_headers"] = {"error": err, "elapsed_seconds": round(elapsed, 2)}
+        print(f"  REQUEST FAILED after {round(elapsed, 2)}s: {err}")
     print()
 
+    print("  TEST 2 — exact URL, normal browser-like User-Agent + Accept headers:")
+    resp, elapsed, err = _timed_get(url, timeout=30, headers=BROWSER_LIKE_HEADERS)
+    if resp is not None:
+        result["test_2_browser_headers"] = _summarize_response("browser-like headers", resp, elapsed)
+    else:
+        result["test_2_browser_headers"] = {"error": err, "elapsed_seconds": round(elapsed, 2)}
+        print(f"  REQUEST FAILED after {round(elapsed, 2)}s: {err}")
+    print()
+
+    # --- SABIC FY2024 official report/index page ------------------------------
+    print("SABIC FY2024 official report/index page")
     report_page_url = DIAGNOSTIC_REPORT_PAGE_CANDIDATES.get(company_slug)
     if report_page_url:
-        print(f"TEST 3 — known official report-index page (diagnostic only, NOT registered):")
-        print(f"  {report_page_url}")
-        try:
-            resp3 = requests.get(report_page_url, timeout=30, headers=BROWSER_LIKE_HEADERS)
-            result["test_3_report_page"] = _summarize_response("report-index page", resp3)
-        except Exception as e:
-            result["test_3_report_page"] = {"error": f"{type(e).__name__}: {e}"}
-            print(f"  REQUEST FAILED: {result['test_3_report_page']['error']}")
+        print(f"  (diagnostic only, NOT registered) {report_page_url}")
+        resp, elapsed, err = _timed_get(report_page_url, timeout=30, headers=BROWSER_LIKE_HEADERS)
+        if resp is not None:
+            result["test_3_report_page"] = _summarize_response("report-index page", resp, elapsed)
+        else:
+            result["test_3_report_page"] = {"error": err, "elapsed_seconds": round(elapsed, 2)}
+            print(f"  REQUEST FAILED after {round(elapsed, 2)}s: {err}")
     else:
-        print("TEST 3 — no diagnostic report-index page known for this company; skipped.")
+        print("  No diagnostic report-index page known for this company; skipped.")
         result["test_3_report_page"] = None
 
     print()
     print("=" * 78)
     print("CONCLUSIONS")
     print("=" * 78)
+    ctrl = result.get("control_test_us_pdf", {})
     t1 = result.get("test_1_default_headers", {})
     t2 = result.get("test_2_browser_headers", {})
-    print(f"Network reachable (TCP/TLS connect succeeded)? "
-          f"{'yes' if 'http_status' in t1 or 'http_status' in t2 else 'unknown/no — see errors above'}")
-    if "http_status" in t1:
-        print(f"Direct PDF URL response (default headers)  : HTTP {t1['http_status']}, "
-              f"{t1['content_type']}, pdf_magic={t1['starts_with_pdf_magic']}")
-    if "http_status" in t2:
-        print(f"Direct PDF URL response (browser headers)   : HTTP {t2['http_status']}, "
-              f"{t2['content_type']}, pdf_magic={t2['starts_with_pdf_magic']}")
-        if t1.get("http_status") != t2.get("http_status"):
-            print("  -> Header-sensitive response: default vs. browser-like headers got a "
-                  "DIFFERENT HTTP status. Possible bot/WAF filtering on request headers.")
-        else:
-            print("  -> Same HTTP status regardless of headers: the 500 is not simply "
-                  "explained by a missing/unusual User-Agent.")
+
+    if ctrl.get("starts_with_pdf_magic"):
+        print("A) Render CAN download real PDF bytes generally — control test succeeded "
+              f"(HTTP {ctrl['http_status']}, {ctrl['response_size_bytes']} bytes, "
+              f"{ctrl.get('elapsed_seconds')}s).")
+    elif "http_status" in ctrl:
+        print(f"A) Render reached the U.S. control host but did NOT get a PDF back "
+              f"(HTTP {ctrl['http_status']}, {ctrl['content_type']}) — possible broader issue.")
+    else:
+        print(f"A) Render could not even reach the U.S. control host: {ctrl.get('error')} "
+              "— points to (C) a broader Render/network issue, not something SABIC-specific.")
+
+    sabic_pdf_ok = t1.get("starts_with_pdf_magic") or t2.get("starts_with_pdf_magic")
+    if sabic_pdf_ok:
+        print("B) SABIC direct PDF URL returned real PDF bytes.")
+    elif "http_status" in t1 or "http_status" in t2:
+        statuses = {t1.get("http_status"), t2.get("http_status")} - {None}
+        print(f"B) SABIC direct PDF URL did NOT return PDF bytes (HTTP {sorted(statuses)}).")
+        if ctrl.get("starts_with_pdf_magic"):
+            print("   -> Control PDF succeeded but SABIC PDF did not: this looks "
+                  "SABIC-specific, not a general Render/network problem.")
+    else:
+        print(f"B) Could not reach the SABIC direct PDF URL at all: "
+              f"{t1.get('error') or t2.get('error')}")
+
+    if t1.get("http_status") != t2.get("http_status") and "http_status" in t1 and "http_status" in t2:
+        print("   -> Header-sensitive response: default vs. browser-like headers got a "
+              "DIFFERENT HTTP status. Possible bot/WAF filtering on request headers.")
+
     t3 = result.get("test_3_report_page")
     if t3 and "http_status" in t3:
-        print(f"Report-index page response                  : HTTP {t3['http_status']} at "
-              f"final URL {t3['final_url']}")
+        print(f"Report-index page response: HTTP {t3['http_status']} at final URL {t3['final_url']}")
     print("=" * 78)
     return result
 
