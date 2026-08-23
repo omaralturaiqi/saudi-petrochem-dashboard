@@ -48,10 +48,12 @@ USAGE:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
+from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 # Allow running this script directly (`python3 scripts/acquire_official_pdfs.py`)
 # as well as as a module (`python3 -m scripts.acquire_official_pdfs`) by
@@ -456,6 +458,202 @@ def diagnose_http_investigation(company_slug: str, fiscal_year: int) -> dict:
     return result
 
 
+# --- Report-page link discovery ---------------------------------------------
+# Investigates whether a company's official report-index PAGE (which may
+# return HTTP 200 even when the direct PDF URL is blocked) exposes a
+# different download/CDN URL for the target fiscal year's report. Uses only
+# the standard library (html.parser + re) — no new dependency added to
+# requirements.txt. Diagnostic only: makes exactly ONE GET request, never
+# downloads a PDF, never saves the HTML body to disk, never modifies any
+# registry.
+
+DOCUMENT_LINK_KEYWORDS = ("pdf", "annual", "report", "download", "document")
+
+# Looks for JS variables/fetch calls/API-style paths that reference annual
+# reports — a small, fixed set of patterns, not an open-ended crawler.
+JS_REFERENCE_PATTERN = re.compile(
+    r'''(?:var|let|const)\s+\w+\s*=\s*["']([^"']*(?:annual|report|pdf)[^"']*)["']'''
+    r'''|fetch\(\s*["']([^"']*(?:annual|report|pdf)[^"']*)["']'''
+    r'''|["'](/api/[^"']*(?:annual|report)[^"']*)["']''',
+    re.IGNORECASE,
+)
+# data-* attributes whose value looks like a document/download URL.
+DATA_ATTRIBUTE_PATTERN = re.compile(
+    r'''data-[\w-]+\s*=\s*["']([^"']*(?:pdf|download|document)[^"']*)["']''',
+    re.IGNORECASE,
+)
+
+
+class _ReportLinkHTMLParser(HTMLParser):
+    """Collects <a href>, <iframe src>, <embed src>, <object data> candidates
+    plus a short window of surrounding text as context. Pure parsing, no
+    network I/O, no file writes."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.candidates: list[dict] = []
+        self._recent_text = ""
+        self._capturing_anchor: dict | None = None
+
+    def handle_starttag(self, tag, attrs):
+        # Each candidate's "preceding" context is the text seen since the
+        # PREVIOUS candidate-producing tag only (not the whole document) —
+        # the buffer is reset right after being read, so an unrelated link
+        # later in the page never inherits an earlier link's "2024"/"report"
+        # wording just because it appeared somewhere earlier on the page.
+        attrs_dict = dict(attrs)
+        if tag == "a" and attrs_dict.get("href"):
+            self._capturing_anchor = {
+                "href": attrs_dict["href"], "text": "",
+                "preceding": self._recent_text[-150:],
+            }
+            self._recent_text = ""
+        elif tag == "iframe" and attrs_dict.get("src"):
+            self.candidates.append({
+                "source": "iframe_src", "url": attrs_dict["src"],
+                "context": self._recent_text[-150:],
+            })
+            self._recent_text = ""
+        elif tag == "embed" and attrs_dict.get("src"):
+            self.candidates.append({
+                "source": "embed_src", "url": attrs_dict["src"],
+                "context": self._recent_text[-150:],
+            })
+            self._recent_text = ""
+        elif tag == "object" and attrs_dict.get("data"):
+            self.candidates.append({
+                "source": "object_data", "url": attrs_dict["data"],
+                "context": self._recent_text[-150:],
+            })
+            self._recent_text = ""
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._capturing_anchor is not None:
+            anchor = self._capturing_anchor
+            context = f"{anchor['preceding']} [LINK TEXT: {anchor['text'].strip()}]"
+            self.candidates.append({"source": "a_href", "url": anchor["href"], "context": context})
+            self._capturing_anchor = None
+            self._recent_text = ""
+
+    def handle_data(self, data):
+        if self._capturing_anchor is not None:
+            self._capturing_anchor["text"] += data
+        self._recent_text = (self._recent_text + data)[-500:]
+
+
+def extract_report_link_candidates(html_text: str, base_url: str) -> list[dict]:
+    """Pure function: parses html_text (already-fetched HTML, no I/O here)
+    and returns a list of {source, url, resolved_url, context} dicts —
+    hrefs/iframe/embed/object candidates plus JS-reference and data-attribute
+    matches found via regex over the raw HTML. Relative URLs are resolved
+    against base_url."""
+    parser = _ReportLinkHTMLParser()
+    parser.feed(html_text)
+    candidates = list(parser.candidates)
+
+    for match in JS_REFERENCE_PATTERN.finditer(html_text):
+        url = next((g for g in match.groups() if g), None)
+        if not url:
+            continue
+        start, end = max(0, match.start() - 60), min(len(html_text), match.end() + 60)
+        candidates.append({"source": "js_reference", "url": url, "context": html_text[start:end]})
+
+    for match in DATA_ATTRIBUTE_PATTERN.finditer(html_text):
+        url = match.group(1)
+        start, end = max(0, match.start() - 60), min(len(html_text), match.end() + 60)
+        candidates.append({"source": "data_attribute", "url": url, "context": html_text[start:end]})
+
+    for c in candidates:
+        c["resolved_url"] = urljoin(base_url, c["url"])
+    return candidates
+
+
+def _classify_candidate(url: str, context: str, target_fiscal_year: int) -> str:
+    haystack = f"{url} {context}".lower()
+    has_year = str(target_fiscal_year) in haystack
+    has_doc_keyword = any(kw in haystack for kw in DOCUMENT_LINK_KEYWORDS)
+    if has_year and (".pdf" in url.lower() or has_doc_keyword):
+        return "VERIFIED_FY_CANDIDATE"
+    if has_doc_keyword:
+        return "POSSIBLE_CANDIDATE"
+    return "UNRELATED"
+
+
+def diagnose_report_page_links(company_slug: str, target_fiscal_year: int) -> dict:
+    """Fetches a company's known official report-index page EXACTLY ONCE
+    and inspects its HTML for how the target fiscal year's report is
+    actually linked (direct href, iframe/embed/object, JS reference, or a
+    data-* attribute), classifying each candidate as a VERIFIED FYnnnn
+    candidate, a POSSIBLE candidate, or an UNRELATED report link. Diagnostic
+    only — never downloads a PDF, never saves the HTML body to disk, never
+    touches any *_SOURCE_REGISTRY."""
+    report_page_url = DIAGNOSTIC_REPORT_PAGE_CANDIDATES.get(company_slug)
+    result = {
+        "company_slug": company_slug,
+        "target_fiscal_year": target_fiscal_year,
+        "report_page_url": report_page_url,
+    }
+
+    print("=" * 78)
+    print(f"REPORT-PAGE LINK DISCOVERY: {company_slug} — target FY{target_fiscal_year}")
+    print("=" * 78)
+
+    if not report_page_url:
+        print("No diagnostic report-index page known for this company; nothing to test.")
+        result["error"] = "no report page url"
+        return result
+
+    print(f"Fetching (exactly ONE GET request): {report_page_url}")
+    resp, elapsed, err = _timed_get(report_page_url, timeout=30, headers=BROWSER_LIKE_HEADERS)
+    result["elapsed_seconds"] = round(elapsed, 2)
+    if resp is None:
+        result["error"] = err
+        print(f"REQUEST FAILED after {result['elapsed_seconds']}s: {err}")
+        print("=" * 78)
+        return result
+
+    content_type = resp.headers.get("Content-Type", "unknown")
+    result["http_status"] = resp.status_code
+    result["content_type"] = content_type
+    result["response_size_bytes"] = len(resp.content)
+    print(f"HTTP status  : {resp.status_code}")
+    print(f"Content-Type : {content_type}")
+    print(f"Response size: {result['response_size_bytes']} bytes")
+    print(f"Elapsed      : {result['elapsed_seconds']}s")
+
+    if resp.status_code != 200 or "html" not in content_type.lower():
+        print("Response is not a 200 HTML page — nothing to parse.")
+        result["candidates"] = []
+        print("=" * 78)
+        return result
+
+    candidates = extract_report_link_candidates(resp.text, resp.url)
+    for c in candidates:
+        c["classification"] = _classify_candidate(c["url"], c["context"], target_fiscal_year)
+    result["candidates"] = candidates
+
+    sections = (
+        (f"VERIFIED FY{target_fiscal_year} candidate", "VERIFIED_FY_CANDIDATE"),
+        ("POSSIBLE candidate", "POSSIBLE_CANDIDATE"),
+        ("UNRELATED report link", "UNRELATED"),
+    )
+    for label, key in sections:
+        matches = [c for c in candidates if c["classification"] == key]
+        print()
+        print(f"{label} ({len(matches)}):")
+        if not matches:
+            print("  (none found)")
+        for c in matches:
+            print(f"  [{c['source']}] {c['resolved_url']}")
+            if c["resolved_url"] != c["url"]:
+                print(f"      raw (relative): {c['url']}")
+            print(f"      context: {c['context'].strip()[:200]!r}")
+
+    print()
+    print("=" * 78)
+    return result
+
+
 def run_full_acquisition() -> dict:
     """Runs acquire_reports() for every company, full FY2015-2024 range.
     acquire_reports()/acquire_one_report() already skip report_page and
@@ -524,6 +722,14 @@ def main():
              "retries, no curl, does not save the HTML body to disk, and "
              "does not modify any registry.",
     )
+    parser.add_argument(
+        "--diagnose-page-links", nargs=2, metavar=("COMPANY_SLUG", "FISCAL_YEAR"),
+        help="Fetch a company's known official report-index page EXACTLY "
+             "ONCE and inspect its HTML for how the target fiscal year's "
+             "report is actually linked (href/iframe/embed/object/JS "
+             "reference/data-attribute). Diagnostic only: no PDF download, "
+             "no HTML saved to disk, no registry changes.",
+    )
     args = parser.parse_args()
 
     if args.diagnose_http:
@@ -533,6 +739,15 @@ def main():
             print(f"Unknown company_slug: {slug!r}. Known: {sorted(COMPANY_SOURCE_REGISTRIES)}")
             sys.exit(1)
         diagnose_http_investigation(slug, fy)
+        return
+
+    if args.diagnose_page_links:
+        slug, fy = args.diagnose_page_links
+        fy = int(fy)
+        if slug not in COMPANY_SOURCE_REGISTRIES:
+            print(f"Unknown company_slug: {slug!r}. Known: {sorted(COMPANY_SOURCE_REGISTRIES)}")
+            sys.exit(1)
+        diagnose_report_page_links(slug, fy)
         return
 
     if args.diagnose:

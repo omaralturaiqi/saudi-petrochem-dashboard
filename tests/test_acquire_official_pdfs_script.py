@@ -28,6 +28,9 @@ from scripts.acquire_official_pdfs import (
     diagnose_http_investigation,
     CONTROL_TEST_US_PDF_URL,
     DIAGNOSTIC_REPORT_PAGE_CANDIDATES,
+    extract_report_link_candidates,
+    _classify_candidate,
+    diagnose_report_page_links,
 )
 
 
@@ -257,6 +260,145 @@ class TestDiagnoseHttpInvestigationControlTest(unittest.TestCase):
                 result = diagnose_http_investigation("sabic", 2024)
         self.assertIn("ConnectionError", result["control_test_us_pdf"]["error"])
         self.assertTrue(result["test_1_default_headers"]["starts_with_pdf_magic"])
+
+
+class TestExtractReportLinkCandidates(unittest.TestCase):
+    BASE_URL = "https://www.sabic.com/en/investors/performance-financial-highlights/annual-report"
+
+    def test_finds_direct_href_and_resolves_relative_url(self):
+        html = '''
+        <html><body>
+          <p>SABIC Integrated Annual Report 2024</p>
+          <a href="/en/Images/SABIC-Annual-Report-2024-EN.pdf">Download FY2024 report</a>
+        </body></html>
+        '''
+        candidates = extract_report_link_candidates(html, self.BASE_URL)
+        hrefs = [c for c in candidates if c["source"] == "a_href"]
+        self.assertEqual(len(hrefs), 1)
+        self.assertEqual(hrefs[0]["url"], "/en/Images/SABIC-Annual-Report-2024-EN.pdf")
+        self.assertEqual(
+            hrefs[0]["resolved_url"],
+            "https://www.sabic.com/en/Images/SABIC-Annual-Report-2024-EN.pdf",
+        )
+        self.assertIn("2024", hrefs[0]["context"])
+
+    def test_finds_iframe_embed_object_sources(self):
+        html = '''
+        <iframe src="/reports/2024-viewer.html"></iframe>
+        <embed src="/reports/2024-embed.pdf">
+        <object data="/reports/2024-object.pdf"></object>
+        '''
+        candidates = extract_report_link_candidates(html, self.BASE_URL)
+        sources = {c["source"]: c["url"] for c in candidates}
+        self.assertEqual(sources.get("iframe_src"), "/reports/2024-viewer.html")
+        self.assertEqual(sources.get("embed_src"), "/reports/2024-embed.pdf")
+        self.assertEqual(sources.get("object_data"), "/reports/2024-object.pdf")
+
+    def test_finds_js_variable_and_fetch_reference(self):
+        html = '''
+        <script>
+          var reportUrl = "https://cdn.sabic.com/2024/annual-report.pdf";
+          fetch("/api/annual-reports/2024");
+        </script>
+        '''
+        candidates = extract_report_link_candidates(html, self.BASE_URL)
+        js = [c for c in candidates if c["source"] == "js_reference"]
+        urls = {c["url"] for c in js}
+        self.assertIn("https://cdn.sabic.com/2024/annual-report.pdf", urls)
+        self.assertIn("/api/annual-reports/2024", urls)
+
+    def test_finds_data_attribute_reference(self):
+        html = '<div data-download-url="/files/2024-report-document.pdf"></div>'
+        candidates = extract_report_link_candidates(html, self.BASE_URL)
+        data_attrs = [c for c in candidates if c["source"] == "data_attribute"]
+        self.assertEqual(len(data_attrs), 1)
+        self.assertEqual(data_attrs[0]["url"], "/files/2024-report-document.pdf")
+
+    def test_no_candidates_in_plain_html(self):
+        html = "<html><body><p>Nothing to see here.</p></body></html>"
+        candidates = extract_report_link_candidates(html, self.BASE_URL)
+        self.assertEqual(candidates, [])
+
+
+class TestClassifyCandidate(unittest.TestCase):
+    def test_pdf_url_with_matching_year_is_verified(self):
+        verdict = _classify_candidate(
+            "/en/Images/SABIC-Annual-Report-2024-EN.pdf",
+            "Download FY2024 report", 2024,
+        )
+        self.assertEqual(verdict, "VERIFIED_FY_CANDIDATE")
+
+    def test_document_keyword_without_year_is_possible(self):
+        verdict = _classify_candidate("/reports/download-report.pdf", "click here", 2024)
+        self.assertEqual(verdict, "POSSIBLE_CANDIDATE")
+
+    def test_year_present_but_no_document_keyword_is_unrelated(self):
+        # "2024" appears but nothing marks it as a document/report link at
+        # all -> not promoted to VERIFIED or POSSIBLE just for having a year.
+        verdict = _classify_candidate("/careers/2024-jobs", "Careers page 2024", 2024)
+        self.assertEqual(verdict, "UNRELATED")
+
+    def test_older_year_report_link_is_unrelated_to_target_year(self):
+        verdict = _classify_candidate(
+            "/en/Images/SABIC-Annual-Report-2022-EN.pdf",
+            "Download 2022 report", 2024,
+        )
+        # Has doc keywords ("annual"/"report"/"pdf") but not the 2024 target
+        # year -> POSSIBLE, not VERIFIED (still surfaced, not silently lost).
+        self.assertEqual(verdict, "POSSIBLE_CANDIDATE")
+
+    def test_completely_unrelated_link_is_unrelated(self):
+        verdict = _classify_candidate("/careers/apply", "Join our team", 2024)
+        self.assertEqual(verdict, "UNRELATED")
+
+
+class TestDiagnoseReportPageLinks(unittest.TestCase):
+    def test_makes_exactly_one_request_and_classifies_sections(self):
+        html = '''
+        <html><body>
+          <p>SABIC Integrated Annual Report 2024</p>
+          <a href="/en/Images/SABIC-Annual-Report-2024-EN.pdf">Download FY2024</a>
+          <a href="/en/Images/SABIC-Annual-Report-2022-EN.pdf">Download 2022 report</a>
+          <a href="/careers/apply">Careers</a>
+        </body></html>
+        '''
+        fake = _fake_response(status_code=200, content=html.encode("utf-8"),
+                               content_type="text/html", url=DIAGNOSTIC_REPORT_PAGE_CANDIDATES["sabic"])
+        buf = io.StringIO()
+        with patch("requests.get", return_value=fake) as mock_get:
+            with redirect_stdout(buf):
+                result = diagnose_report_page_links("sabic", 2024)
+        output = buf.getvalue()
+
+        mock_get.assert_called_once()
+        self.assertEqual(result["http_status"], 200)
+        self.assertIn("VERIFIED FY2024 candidate", output)
+        self.assertIn("POSSIBLE candidate", output)
+        self.assertIn("UNRELATED report link", output)
+
+        classifications = {c["url"]: c["classification"] for c in result["candidates"]}
+        self.assertEqual(
+            classifications["/en/Images/SABIC-Annual-Report-2024-EN.pdf"],
+            "VERIFIED_FY_CANDIDATE",
+        )
+        self.assertEqual(classifications["/careers/apply"], "UNRELATED")
+
+    def test_no_known_report_page_short_circuits_without_network(self):
+        buf = io.StringIO()
+        with patch("requests.get") as mock_get:
+            with redirect_stdout(buf):
+                result = diagnose_report_page_links("yansab", 2024)
+        mock_get.assert_not_called()
+        self.assertEqual(result.get("error"), "no report page url")
+
+    def test_non_html_response_produces_no_candidates(self):
+        fake = _fake_response(status_code=200, content=b"%PDF-not actually html",
+                               content_type="application/pdf")
+        buf = io.StringIO()
+        with patch("requests.get", return_value=fake):
+            with redirect_stdout(buf):
+                result = diagnose_report_page_links("sabic", 2024)
+        self.assertEqual(result["candidates"], [])
 
 
 class TestScriptDoesNotImportNetworkAtModuleLevel(unittest.TestCase):
