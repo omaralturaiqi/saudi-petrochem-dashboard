@@ -782,13 +782,23 @@ def _classify_endpoint_candidate(raw_value: str, context: str, target_fiscal_yea
     return "UNRELATED"
 
 
-def diagnose_report_endpoints(company_slug: str, target_fiscal_year: int) -> dict:
+def diagnose_report_endpoints(company_slug: str, target_fiscal_year: int,
+                               report_page_url: str | None = None) -> dict:
     """Extends diagnose_report_page_links() with inline-script, external-JS,
     and JSON-blob endpoint discovery, then tests (read-only, max 3 GETs,
     no retries) only the HIGH-CONFIDENCE endpoints found. Never downloads
     or saves a PDF, never saves HTML/JS to disk, never modifies any
-    registry or acquisition logic."""
-    report_page_url = DIAGNOSTIC_REPORT_PAGE_CANDIDATES.get(company_slug)
+    registry or acquisition logic.
+
+    report_page_url: optional override for the page to inspect, used for
+    THIS call only — e.g. to point at a different official page (such as
+    an archive/publications index) for the same company without touching
+    DIAGNOSTIC_REPORT_PAGE_CANDIDATES or any *_SOURCE_REGISTRY. When
+    omitted (the default, used by every existing caller), behavior is
+    byte-for-byte unchanged: the company's registered diagnostic page is
+    used, exactly as before this parameter existed."""
+    if report_page_url is None:
+        report_page_url = DIAGNOSTIC_REPORT_PAGE_CANDIDATES.get(company_slug)
     result = {
         "company_slug": company_slug, "target_fiscal_year": target_fiscal_year,
         "report_page_url": report_page_url,
@@ -1078,6 +1088,15 @@ def main():
              "CONFIDENCE endpoints found, max 3 GETs. No PDF download, no "
              "HTML/JS saved to disk, no registry/acquisition-logic changes.",
     )
+    parser.add_argument(
+        "--report-page-url", metavar="URL",
+        help="Override the page fetched by --diagnose-report-endpoints for "
+             "this run only (e.g. a different official archive/publications "
+             "page for the same company). Does not modify "
+             "DIAGNOSTIC_REPORT_PAGE_CANDIDATES or any registry — the "
+             "override applies only to this single invocation. Ignored by "
+             "every other flag.",
+    )
     args = parser.parse_args()
 
     if args.diagnose_http:
@@ -1104,7 +1123,7 @@ def main():
         if slug not in COMPANY_SOURCE_REGISTRIES:
             print(f"Unknown company_slug: {slug!r}. Known: {sorted(COMPANY_SOURCE_REGISTRIES)}")
             sys.exit(1)
-        diagnose_report_endpoints(slug, fy)
+        diagnose_report_endpoints(slug, fy, report_page_url=args.report_page_url)
         return
 
     if args.diagnose:

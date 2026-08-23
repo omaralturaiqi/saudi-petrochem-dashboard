@@ -693,6 +693,75 @@ class TestDiagnoseReportEndpoints(unittest.TestCase):
         self.assertIn("No reliable/verified path", output)
 
 
+class TestDiagnoseReportEndpointsReportPageUrlOverride(unittest.TestCase):
+    """Covers the optional report_page_url override: explicit-URL
+    acceptance, unchanged default behavior, and that the override never
+    mutates DIAGNOSTIC_REPORT_PAGE_CANDIDATES or any registry."""
+
+    ARCHIVE_URL = "https://www.sabic.com/en/newsandmedia/media-centre-publications"
+
+    def test_explicit_archive_url_is_fetched_instead_of_default(self):
+        html = '<html><body><a href="/en/careers">Careers</a></body></html>'
+        fake = _fake_response(status_code=200, content=html.encode(),
+                               content_type="text/html", url=self.ARCHIVE_URL)
+
+        def fake_get(url, **kwargs):
+            if url == self.ARCHIVE_URL:
+                return fake
+            raise AssertionError(f"default sabic page should not be fetched: {url}")
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_report_endpoints("sabic", 2024, report_page_url=self.ARCHIVE_URL)
+        self.assertEqual(result["report_page_url"], self.ARCHIVE_URL)
+        self.assertIn(self.ARCHIVE_URL, buf.getvalue())
+
+    def test_omitting_override_keeps_default_company_url_unchanged(self):
+        default_url = DIAGNOSTIC_REPORT_PAGE_CANDIDATES["sabic"]
+        fake = _fake_response(status_code=200, content=b"<html></html>",
+                               content_type="text/html", url=default_url)
+
+        def fake_get(url, **kwargs):
+            if url == default_url:
+                return fake
+            raise AssertionError(f"unexpected URL requested: {url}")
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_report_endpoints("sabic", 2024)
+        self.assertEqual(result["report_page_url"], default_url)
+
+    def test_override_does_not_mutate_diagnostic_candidates_or_registry(self):
+        candidates_before = dict(DIAGNOSTIC_REPORT_PAGE_CANDIDATES)
+        from ingestion.load_historical import COMPANY_SOURCE_REGISTRIES
+        import copy
+        registries_before = copy.deepcopy(COMPANY_SOURCE_REGISTRIES)
+
+        fake = _fake_response(status_code=200, content=b"<html></html>",
+                               content_type="text/html", url=self.ARCHIVE_URL)
+        buf = io.StringIO()
+        with patch("requests.get", return_value=fake):
+            with redirect_stdout(buf):
+                diagnose_report_endpoints("sabic", 2024, report_page_url=self.ARCHIVE_URL)
+
+        self.assertEqual(DIAGNOSTIC_REPORT_PAGE_CANDIDATES, candidates_before)
+        self.assertEqual(COMPANY_SOURCE_REGISTRIES, registries_before)
+        # Also confirm the override never leaked into the shared config dict.
+        self.assertNotEqual(DIAGNOSTIC_REPORT_PAGE_CANDIDATES.get("sabic"), self.ARCHIVE_URL)
+
+    def test_override_performs_no_real_network_io(self):
+        # Same invariant as the rest of this file: everything is mocked.
+        fake = _fake_response(status_code=200, content=b"<html></html>",
+                               content_type="text/html", url=self.ARCHIVE_URL)
+        buf = io.StringIO()
+        with patch("requests.get", return_value=fake) as mock_get:
+            with redirect_stdout(buf):
+                diagnose_report_endpoints("sabic", 2024, report_page_url=self.ARCHIVE_URL)
+        mock_get.assert_called_once()
+
+
 class TestScriptDoesNotImportNetworkAtModuleLevel(unittest.TestCase):
     def test_module_imports_without_making_any_request(self):
         # Simply importing the module must not perform network I/O — this
