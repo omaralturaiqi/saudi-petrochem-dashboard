@@ -755,29 +755,53 @@ def _extract_js_endpoint_candidates(js_text: str, source_label: str) -> list[dic
     return found
 
 
+def _looks_like_document_url(url: str) -> bool:
+    """True only for a URL that actually points AT a document/file, not a
+    navigational index page. Checked against the URL's path only (query
+    strings like "?v=..." stripped), using the two patterns every real
+    report link seen across every registry and every live diagnostic run
+    in this codebase has actually used: a .pdf extension, or SABIC's own
+    document CDN path (/Images/...). A plain nav page merely mentioning
+    "report"/"investor"/"publications" in its path (e.g. /en/investors,
+    /en/reports, /en/newsandmedia/reports) does NOT qualify — that keyword-
+    only false positive was exactly what previously flooded the POSSIBLE
+    section with ordinary navigation links instead of real documents."""
+    path = urlparse(url).path.lower()
+    return path.endswith(".pdf") or "/images/" in path
+
+
 def _classify_endpoint_candidate(raw_value: str, context: str, target_fiscal_year: int,
                                   json_year=None) -> str:
-    """HIGH_CONFIDENCE / POSSIBLE / UNRELATED — deliberately stricter than a
-    plain keyword match: an /api/ path or .pdf URL only counts as
-    HIGH_CONFIDENCE when it's also tied to the target fiscal year (via a
-    matching JSON "year" field or the year appearing in the URL/context),
-    or an /api/ path also carries a report/document keyword. A bare keyword
-    hit with none of that is POSSIBLE, not HIGH_CONFIDENCE — this is meant
-    to find the ACTUAL path SABIC uses, not just any link mentioning
-    "report"."""
+    """HIGH_CONFIDENCE / POSSIBLE / UNRELATED.
+
+    HIGH_CONFIDENCE requires the candidate to be BOTH a real document/API
+    endpoint AND tied to the target fiscal year (matching JSON "year"
+    field, or the year appearing in the URL/context for a document URL,
+    or an /api/ path carrying a report/document keyword).
+
+    POSSIBLE covers a real document URL or /api/ path that isn't (yet)
+    confirmed to be the target year — e.g. a genuine, current annual-
+    report PDF for a DIFFERENT year, which is exactly what should surface
+    here rather than being lost in a wall of keyword-only navigation
+    links.
+
+    A bare keyword hit on a URL that is neither a document URL nor an
+    /api/ path (ordinary navigation: /en/investors, /en/reports, ...) is
+    UNRELATED — it is not a report/document link just because the word
+    "report" or "investor" appears somewhere in its path."""
     if json_year is not None and str(json_year) == str(target_fiscal_year):
         return "HIGH_CONFIDENCE"
     haystack = f"{raw_value} {context}".lower()
     has_year = str(target_fiscal_year) in haystack
     is_api_path = "/api/" in raw_value.lower()
-    has_pdf = ".pdf" in raw_value.lower()
+    is_document_url = _looks_like_document_url(raw_value)
     keyword_hits = [k for k in ENDPOINT_KEYWORDS if k in haystack]
 
     if is_api_path and keyword_hits:
         return "HIGH_CONFIDENCE"
-    if has_pdf and has_year:
+    if is_document_url and has_year:
         return "HIGH_CONFIDENCE"
-    if keyword_hits or is_api_path or has_pdf:
+    if is_document_url or is_api_path:
         return "POSSIBLE"
     return "UNRELATED"
 

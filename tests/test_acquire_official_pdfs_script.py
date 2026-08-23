@@ -36,6 +36,7 @@ from scripts.acquire_official_pdfs import (
     _extract_js_endpoint_candidates,
     _parse_json_doc_blob,
     _classify_endpoint_candidate,
+    _looks_like_document_url,
     diagnose_report_endpoints,
 )
 
@@ -487,9 +488,16 @@ class TestClassifyEndpointCandidate(unittest.TestCase):
         verdict = _classify_endpoint_candidate("/files/report.pdf", "", 2024, json_year=2022)
         self.assertNotEqual(verdict, "HIGH_CONFIDENCE")
 
-    def test_keyword_only_without_api_or_year_is_possible(self):
+    def test_keyword_only_navigation_link_is_unrelated_not_possible(self):
+        # This is the exact false-positive this fix addresses: a plain
+        # navigation/index page (not a document, not an /api/ path) that
+        # merely contains a report/investor keyword in its own path must
+        # NOT be promoted to POSSIBLE just for that — SABIC's real page
+        # has dozens of these (/en/investors, /en/reports, /en/newsandmedia
+        # /reports, /en/sustainability/governance-and-reporting, ...) and
+        # they used to drown out genuine document candidates.
         verdict = _classify_endpoint_candidate("/investor/publications", "some text", 2024)
-        self.assertEqual(verdict, "POSSIBLE")
+        self.assertEqual(verdict, "UNRELATED")
 
     def test_api_path_without_any_keyword_is_possible_not_high(self):
         verdict = _classify_endpoint_candidate("/api/user/session", "", 2024)
@@ -498,6 +506,47 @@ class TestClassifyEndpointCandidate(unittest.TestCase):
     def test_completely_unrelated_is_unrelated(self):
         verdict = _classify_endpoint_candidate("/careers/apply", "Join our team", 2024)
         self.assertEqual(verdict, "UNRELATED")
+
+    def test_pdf_document_url_wrong_year_is_possible_not_unrelated(self):
+        # The real SABIC case: a genuine, current annual-report PDF (the
+        # 2025 report) is a real document — it must surface as POSSIBLE,
+        # not get lost as UNRELATED just because the target year is 2024.
+        verdict = _classify_endpoint_candidate(
+            "https://www.sabic.com/en/Images/SABIC-Integrated-Annual-Report-2025-EN_tcm1010-49452.pdf",
+            "Integrated Annual Report 2025 (PDF)", 2024,
+        )
+        self.assertEqual(verdict, "POSSIBLE")
+
+    def test_sabic_images_path_without_pdf_extension_counts_as_document_url(self):
+        verdict = _classify_endpoint_candidate(
+            "https://www.sabic.com/en/Images/SABIC-Annual-Report-2024-EN", "", 2024,
+        )
+        self.assertEqual(verdict, "HIGH_CONFIDENCE")
+
+    def test_document_url_with_query_string_is_still_detected(self):
+        verdict = _classify_endpoint_candidate(
+            "https://www.sabic.com/en/Images/SABIC-Annual-Report-2024-EN.pdf?v=2", "", 2024,
+        )
+        self.assertEqual(verdict, "HIGH_CONFIDENCE")
+
+
+class TestLooksLikeDocumentUrl(unittest.TestCase):
+    def test_pdf_extension_is_a_document(self):
+        self.assertTrue(_looks_like_document_url("https://www.sabic.com/en/Images/report.pdf"))
+
+    def test_pdf_extension_with_query_string_is_a_document(self):
+        self.assertTrue(_looks_like_document_url("https://www.sabic.com/report.pdf?download=1"))
+
+    def test_generic_js_bundle_is_not_a_document(self):
+        self.assertFalse(_looks_like_document_url("https://www.sabic.com/dist/js/main.js?v=1"))
+
+    def test_images_cdn_path_is_a_document(self):
+        self.assertTrue(_looks_like_document_url("https://www.sabic.com/en/Images/SomeFile"))
+
+    def test_plain_navigation_page_is_not_a_document(self):
+        self.assertFalse(_looks_like_document_url("https://www.sabic.com/en/investors"))
+        self.assertFalse(_looks_like_document_url("https://www.sabic.com/en/reports"))
+        self.assertFalse(_looks_like_document_url("https://www.sabic.com/en/newsandmedia/reports"))
 
 
 class TestDiagnoseReportEndpoints(unittest.TestCase):
