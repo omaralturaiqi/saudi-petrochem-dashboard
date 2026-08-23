@@ -215,6 +215,186 @@ def diagnose_single(company_slug: str, fiscal_year: int) -> dict:
     return result
 
 
+# Diagnostic-only candidate "report index" pages, discovered via WebSearch.
+# These are used ONLY for read-only HTTP-behavior diagnostics — they are
+# NEVER added to any *_SOURCE_REGISTRY and are never used as a download
+# target for acquire_one_report(). Extending this dict does not register a
+# new source; it only gives diagnose_http_investigation() a second, known
+# official URL to test alongside the registered PDF URL.
+DIAGNOSTIC_REPORT_PAGE_CANDIDATES = {
+    "sabic": "https://www.sabic.com/en/investors/performance-financial-highlights/annual-report",
+}
+
+# A normal desktop-browser User-Agent + Accept headers, used only to see
+# whether the direct PDF URL's HTTP 500 is sensitive to request headers
+# (e.g. bot/WAF filtering) — never used to disguise automated bulk
+# downloading, and never combined with retries.
+BROWSER_LIKE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/pdf,text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Bot-protection / WAF / CDN signal hunting is limited to a fixed, small set
+# of well-known header names and body keywords — no brute forcing, no
+# expanding this list based on trial and error against the live site.
+WAF_SIGNAL_HEADERS = (
+    "Server", "Via", "X-Cache", "X-Cache-Hits", "CF-RAY", "cf-mitigated",
+    "X-Akamai-Transformed", "X-Amz-Cf-Id", "X-Sucuri-ID", "X-Sucuri-Cache",
+    "X-Request-Id", "X-Correlation-Id", "Set-Cookie",
+)
+WAF_SIGNAL_BODY_KEYWORDS = (
+    "cloudflare", "akamai", "incapsula", "sucuri", "waf", "captcha",
+    "access denied", "forbidden", "blocked", "bot detection",
+    "internal server error", "500", "error", "not found", "redirect",
+)
+
+
+def _summarize_response(label: str, resp) -> dict:
+    """Common read-only summary for a single requests.Response: status,
+    content-type, size, redirect history, final URL, PDF magic bytes, and
+    (for HTML bodies only) a short truncated snippet + WAF/CDN header and
+    keyword signals. Never writes the body to disk."""
+    content_type = resp.headers.get("Content-Type", "unknown")
+    is_html = "html" in content_type.lower()
+    summary = {
+        "label": label,
+        "http_status": resp.status_code,
+        "content_type": content_type,
+        "response_size_bytes": len(resp.content),
+        "final_url": resp.url,
+        "redirect_history": [(r.status_code, r.url) for r in resp.history],
+        "starts_with_pdf_magic": resp.content[:5] == b"%PDF-",
+    }
+    print(f"  [{label}]")
+    print(f"    HTTP status      : {summary['http_status']}")
+    print(f"    Content-Type     : {content_type}")
+    print(f"    Response size    : {summary['response_size_bytes']} bytes")
+    print(f"    Redirect history : {summary['redirect_history'] or '(none)'}")
+    print(f"    Final URL        : {summary['final_url']}")
+    print(f"    Starts with %PDF-: {summary['starts_with_pdf_magic']}")
+
+    if is_html:
+        text = resp.text
+        title_start = text.lower().find("<title>")
+        title_end = text.lower().find("</title>")
+        title = text[title_start + 7:title_end].strip() if 0 <= title_start < title_end else "(no <title> found)"
+        summary["html_title"] = title
+        print(f"    HTML <title>     : {title!r}")
+
+        present_waf_headers = {h: resp.headers[h] for h in WAF_SIGNAL_HEADERS if h in resp.headers}
+        summary["waf_signal_headers"] = present_waf_headers
+        print(f"    WAF/CDN headers  : {present_waf_headers or '(none of the checked header names present)'}")
+
+        lowered = text.lower()
+        found_keywords = [kw for kw in WAF_SIGNAL_BODY_KEYWORDS if kw in lowered]
+        summary["waf_signal_keywords_in_body"] = found_keywords
+        print(f"    Body keywords    : {found_keywords or '(none of the checked keywords found)'}")
+
+        snippet = text[:500].replace("\n", " ").replace("\r", " ")
+        summary["html_snippet_first_500_chars"] = snippet
+        print(f"    Body snippet(500): {snippet!r}")
+    return summary
+
+
+def diagnose_http_investigation(company_slug: str, fiscal_year: int) -> dict:
+    """Investigates WHY a registered PDF URL returns something other than a
+    real PDF (e.g. HTTP 500 / text/html), without modifying the registry,
+    without retries, without curl, and without saving the HTML body as a
+    file. Makes at most 3 read-only GET requests total:
+      1. The exact registered URL, current requests config (no custom
+         headers) — matches what acquire_one_report() itself sends.
+      2. The exact registered URL, with a normal browser User-Agent/Accept.
+      3. (If a diagnostic report-index page is known for this company) that
+         page, to see whether the *page* is reachable even if the direct
+         PDF link is not.
+    Does NOT call acquire_one_report() — this is HTTP-behavior
+    investigation only, separate from the authoritative acquisition path.
+    """
+    import requests
+
+    registry = COMPANY_SOURCE_REGISTRIES[company_slug]
+    ticker = CONFIRMED_COMPANY_TICKERS[company_slug]
+    key = (ticker, fiscal_year)
+    result = {"company_slug": company_slug, "fiscal_year": fiscal_year}
+
+    print("=" * 78)
+    print(f"HTTP INVESTIGATION: {company_slug} FY{fiscal_year} — why not a real PDF?")
+    print("=" * 78)
+
+    if key not in registry:
+        print(f"No registry entry for {key} — nothing to test.")
+        result["error"] = "no registry entry"
+        return result
+
+    url = registry[key]["source_url"]
+    result["url"] = url
+    print(f"Registered URL: {url}")
+    print()
+
+    print("TEST 1 — exact URL, current requests config (no custom headers):")
+    try:
+        resp1 = requests.get(url, timeout=30)
+        result["test_1_default_headers"] = _summarize_response("default headers", resp1)
+    except Exception as e:
+        result["test_1_default_headers"] = {"error": f"{type(e).__name__}: {e}"}
+        print(f"  REQUEST FAILED: {result['test_1_default_headers']['error']}")
+    print()
+
+    print("TEST 2 — exact URL, normal browser-like User-Agent + Accept headers:")
+    try:
+        resp2 = requests.get(url, timeout=30, headers=BROWSER_LIKE_HEADERS)
+        result["test_2_browser_headers"] = _summarize_response("browser-like headers", resp2)
+    except Exception as e:
+        result["test_2_browser_headers"] = {"error": f"{type(e).__name__}: {e}"}
+        print(f"  REQUEST FAILED: {result['test_2_browser_headers']['error']}")
+    print()
+
+    report_page_url = DIAGNOSTIC_REPORT_PAGE_CANDIDATES.get(company_slug)
+    if report_page_url:
+        print(f"TEST 3 — known official report-index page (diagnostic only, NOT registered):")
+        print(f"  {report_page_url}")
+        try:
+            resp3 = requests.get(report_page_url, timeout=30, headers=BROWSER_LIKE_HEADERS)
+            result["test_3_report_page"] = _summarize_response("report-index page", resp3)
+        except Exception as e:
+            result["test_3_report_page"] = {"error": f"{type(e).__name__}: {e}"}
+            print(f"  REQUEST FAILED: {result['test_3_report_page']['error']}")
+    else:
+        print("TEST 3 — no diagnostic report-index page known for this company; skipped.")
+        result["test_3_report_page"] = None
+
+    print()
+    print("=" * 78)
+    print("CONCLUSIONS")
+    print("=" * 78)
+    t1 = result.get("test_1_default_headers", {})
+    t2 = result.get("test_2_browser_headers", {})
+    print(f"Network reachable (TCP/TLS connect succeeded)? "
+          f"{'yes' if 'http_status' in t1 or 'http_status' in t2 else 'unknown/no — see errors above'}")
+    if "http_status" in t1:
+        print(f"Direct PDF URL response (default headers)  : HTTP {t1['http_status']}, "
+              f"{t1['content_type']}, pdf_magic={t1['starts_with_pdf_magic']}")
+    if "http_status" in t2:
+        print(f"Direct PDF URL response (browser headers)   : HTTP {t2['http_status']}, "
+              f"{t2['content_type']}, pdf_magic={t2['starts_with_pdf_magic']}")
+        if t1.get("http_status") != t2.get("http_status"):
+            print("  -> Header-sensitive response: default vs. browser-like headers got a "
+                  "DIFFERENT HTTP status. Possible bot/WAF filtering on request headers.")
+        else:
+            print("  -> Same HTTP status regardless of headers: the 500 is not simply "
+                  "explained by a missing/unusual User-Agent.")
+    t3 = result.get("test_3_report_page")
+    if t3 and "http_status" in t3:
+        print(f"Report-index page response                  : HTTP {t3['http_status']} at "
+              f"final URL {t3['final_url']}")
+    print("=" * 78)
+    return result
+
+
 def run_full_acquisition() -> dict:
     """Runs acquire_reports() for every company, full FY2015-2024 range.
     acquire_reports()/acquire_one_report() already skip report_page and
@@ -275,7 +455,24 @@ def main():
              "timing, PDF magic-byte check, then full acquire_one_report() "
              "(integrity, page_count, sha256). No smoke test, no full run.",
     )
+    parser.add_argument(
+        "--diagnose-http", nargs=2, metavar=("COMPANY_SLUG", "FISCAL_YEAR"),
+        help="Investigate WHY a registered URL isn't returning a real PDF: "
+             "default headers vs. browser-like headers, redirect history, "
+             "and (if known) the official report-index page. Read-only, no "
+             "retries, no curl, does not save the HTML body to disk, and "
+             "does not modify any registry.",
+    )
     args = parser.parse_args()
+
+    if args.diagnose_http:
+        slug, fy = args.diagnose_http
+        fy = int(fy)
+        if slug not in COMPANY_SOURCE_REGISTRIES:
+            print(f"Unknown company_slug: {slug!r}. Known: {sorted(COMPANY_SOURCE_REGISTRIES)}")
+            sys.exit(1)
+        diagnose_http_investigation(slug, fy)
+        return
 
     if args.diagnose:
         slug, fy = args.diagnose
