@@ -848,8 +848,12 @@ def diagnose_report_endpoints(company_slug: str, target_fiscal_year: int) -> dic
             candidates.append(entry)
 
     # External <script src="..."> files: always noted; only FETCHED
-    # (read-only, no save) when the src URL itself looks report-related,
-    # capped at 2 files to keep this bounded.
+    # (read-only, no save) when the src URL either looks report-related by
+    # keyword OR is served from the SAME ORIGIN as the report page itself —
+    # a generic bundle name (main.js, templates.js, libs.js, ...) carries no
+    # report keyword in its filename, but same-origin JS is still official
+    # first-party code, unlike any third-party/external-domain script (which
+    # remains excluded either way). Still capped at 2 files fetched.
     external_js_fetched = 0
     for src_match in EXTERNAL_SCRIPT_SRC_PATTERN.finditer(html_text):
         src = src_match.group(1)
@@ -858,7 +862,8 @@ def diagnose_report_endpoints(company_slug: str, target_fiscal_year: int) -> dic
             "source": "HTML", "raw_value": src, "resolved_url": resolved_src,
             "reason": "external <script src> file reference", "context": src,
         })
-        looks_relevant = any(kw in src.lower() for kw in ENDPOINT_KEYWORDS)
+        same_origin = urlparse(resolved_src).netloc == urlparse(base_url).netloc
+        looks_relevant = same_origin or any(kw in src.lower() for kw in ENDPOINT_KEYWORDS)
         if looks_relevant and external_js_fetched < 2:
             print(f"Fetching external JS file referenced by the page (read-only, not saved): {resolved_src}")
             js_resp, js_elapsed, js_err = _timed_get(resolved_src, timeout=30, headers=BROWSER_LIKE_HEADERS)

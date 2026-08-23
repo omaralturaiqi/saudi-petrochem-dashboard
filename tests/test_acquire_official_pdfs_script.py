@@ -18,7 +18,7 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -576,15 +576,16 @@ class TestDiagnoseReportEndpoints(unittest.TestCase):
         self.assertEqual(len(result["endpoint_test_results"]), 3)
         self.assertIn("NOTE:", output)
 
-    def test_external_relevant_js_file_is_fetched_and_analyzed(self):
+    def test_keyword_relevant_cross_origin_js_is_still_fetched(self):
+        # (C) Existing keyword-based relevant-JS behavior is unchanged: a
+        # script on a DIFFERENT origin whose filename matches a report
+        # keyword must still be fetched, exactly as before this change.
         html = '''
         <html><body>
-          <script src="/assets/annual-report-loader.js"></script>
-          <script src="/assets/main.bundle.js"></script>
+          <script src="https://cdn.example.com/assets/annual-report-loader.js"></script>
         </body></html>
         '''
-        relevant_js_url = urljoin(self.PAGE_URL, "/assets/annual-report-loader.js")
-        irrelevant_js_url = urljoin(self.PAGE_URL, "/assets/main.bundle.js")
+        relevant_js_url = "https://cdn.example.com/assets/annual-report-loader.js"
         js_content = b'fetch("/api/annual-reports/2024");'
 
         def fake_get(url, **kwargs):
@@ -593,7 +594,7 @@ class TestDiagnoseReportEndpoints(unittest.TestCase):
             if url == relevant_js_url:
                 return _fake_response(status_code=200, content=js_content,
                                        content_type="application/javascript", url=url)
-            raise AssertionError(f"irrelevant JS file should never be fetched: {url}")
+            raise AssertionError(f"unexpected URL requested: {url}")
 
         buf = io.StringIO()
         with patch("requests.get", side_effect=fake_get):
@@ -602,6 +603,84 @@ class TestDiagnoseReportEndpoints(unittest.TestCase):
         self.assertEqual(result["external_js_files_fetched"], 1)
         external_js_candidates = [c for c in result["candidates"] if c["source"] == "external JS"]
         self.assertTrue(any(c["raw_value"] == "/api/annual-reports/2024" for c in external_js_candidates))
+
+    def test_cross_origin_js_without_keyword_is_excluded(self):
+        # (B) A third-party/cross-origin script with a generic, non-keyword
+        # filename must NOT be fetched — same-origin eligibility must never
+        # be broadened to other domains.
+        html = '''
+        <html><body>
+          <script src="https://cdn.example.com/dist/js/main.js"></script>
+        </body></html>
+        '''
+
+        def fake_get(url, **kwargs):
+            if url == self.PAGE_URL:
+                return _fake_response(status_code=200, content=html.encode(), content_type="text/html", url=url)
+            raise AssertionError(f"cross-origin, non-keyword JS must never be fetched: {url}")
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_report_endpoints("sabic", 2024)
+        self.assertEqual(result["external_js_files_fetched"], 0)
+
+    def test_same_origin_generic_js_without_keyword_is_fetched(self):
+        # (A) The actual SABIC case: a same-origin script with a generic
+        # bundle name (main.js/templates.js/libs.js-style) carries no
+        # report keyword in its filename, but must still be eligible for
+        # inspection because it is served from the report page's own host.
+        page_host = urlparse(self.PAGE_URL).scheme + "://" + urlparse(self.PAGE_URL).netloc
+        generic_js_url = page_host + "/dist/js/main.js?v=2.5.1.1_2.46"
+        html = f'''
+        <html><body>
+          <script src="/dist/js/main.js?v=2.5.1.1_2.46"></script>
+        </body></html>
+        '''
+        js_content = b'fetch("/api/annual-reports/2024");'
+
+        def fake_get(url, **kwargs):
+            if url == self.PAGE_URL:
+                return _fake_response(status_code=200, content=html.encode(), content_type="text/html", url=url)
+            if url == generic_js_url:
+                return _fake_response(status_code=200, content=js_content,
+                                       content_type="application/javascript", url=url)
+            raise AssertionError(f"unexpected URL requested: {url}")
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_report_endpoints("sabic", 2024)
+        self.assertEqual(result["external_js_files_fetched"], 1)
+        external_js_candidates = [c for c in result["candidates"] if c["source"] == "external JS"]
+        self.assertTrue(any(c["raw_value"] == "/api/annual-reports/2024" for c in external_js_candidates))
+
+    def test_same_origin_js_fetch_cap_of_two_still_enforced(self):
+        # (D) Even with the same-origin rule making every generic same-
+        # origin script eligible, the existing cap of 2 fetched files
+        # must still hold — no unbounded crawling.
+        html = '''
+        <html><body>
+          <script src="/dist/js/main.js"></script>
+          <script src="/dist/js/templates.js"></script>
+          <script src="/dist/js/libs.js"></script>
+        </body></html>
+        '''
+        fetched_js_urls = []
+
+        def fake_get(url, **kwargs):
+            if url == self.PAGE_URL:
+                return _fake_response(status_code=200, content=html.encode(), content_type="text/html", url=url)
+            fetched_js_urls.append(url)
+            return _fake_response(status_code=200, content=b"// no report data here",
+                                   content_type="application/javascript", url=url)
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_report_endpoints("sabic", 2024)
+        self.assertEqual(result["external_js_files_fetched"], 2)
+        self.assertEqual(len(fetched_js_urls), 2)
 
     def test_no_high_confidence_endpoints_reports_no_reliable_path(self):
         html = '<html><body><a href="/investor/publications">Publications</a></body></html>'
