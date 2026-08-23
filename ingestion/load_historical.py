@@ -432,7 +432,7 @@ SABIC_SOURCE_REGISTRY: dict[tuple[str, int], dict] = {
         "source_type": "pdf",
     },
     ("2010", 2024): {
-        "source_url": "https://www3.sabic.com/en/Images/SABIC-Integrated-Annual-Report-2024-EN-Updated_tcm1010-46870.pdf",
+        "source_url": "https://www.sabic.com/en/Images/SABIC-Integrated-Annual-Report-2024-EN_tcm1010-46870.pdf",
         "source_website": "sabic.com",
         "source_tier": 1,
         "document_type": "annual_report",
