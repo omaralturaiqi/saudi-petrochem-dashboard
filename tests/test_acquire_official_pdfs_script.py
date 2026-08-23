@@ -13,10 +13,12 @@ already covered by tests/test_acquisition.py and
 tests/test_acquisition_generic.py — not duplicated here.
 """
 import io
+import json
 import sys
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
+from urllib.parse import urljoin
 
 import requests
 
@@ -31,6 +33,10 @@ from scripts.acquire_official_pdfs import (
     extract_report_link_candidates,
     _classify_candidate,
     diagnose_report_page_links,
+    _extract_js_endpoint_candidates,
+    _parse_json_doc_blob,
+    _classify_endpoint_candidate,
+    diagnose_report_endpoints,
 )
 
 
@@ -399,6 +405,213 @@ class TestDiagnoseReportPageLinks(unittest.TestCase):
             with redirect_stdout(buf):
                 result = diagnose_report_page_links("sabic", 2024)
         self.assertEqual(result["candidates"], [])
+
+
+class TestExtractJsEndpointCandidates(unittest.TestCase):
+    def test_finds_fetch_call(self):
+        js = 'fetch("/api/annual-reports/2024").then(r => r.json());'
+        found = _extract_js_endpoint_candidates(js, "inline JS")
+        calls = [c for c in found if "fetch()" in c["reason"]]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["raw_value"], "/api/annual-reports/2024")
+        self.assertEqual(calls[0]["source"], "inline JS")
+
+    def test_finds_axios_call(self):
+        js = 'axios.get("/api/investor/documents").then(handleResponse);'
+        found = _extract_js_endpoint_candidates(js, "external JS")
+        calls = [c for c in found if "fetch()" in c["reason"]]
+        self.assertEqual(calls[0]["raw_value"], "/api/investor/documents")
+
+    def test_finds_xhr_open_call(self):
+        js = 'var xhr = new XMLHttpRequest(); xhr.open("GET", "/api/reports/list");'
+        found = _extract_js_endpoint_candidates(js, "inline JS")
+        calls = [c for c in found if "fetch()" in c["reason"]]
+        self.assertEqual(calls[0]["raw_value"], "/api/reports/list")
+
+    def test_finds_generic_keyword_string_literal(self):
+        js = 'const url = "/documents/publications/annual-report-2024.pdf";'
+        found = _extract_js_endpoint_candidates(js, "inline JS")
+        generic = [c for c in found if "string literal" in c["reason"]]
+        self.assertTrue(any(c["raw_value"] == "/documents/publications/annual-report-2024.pdf"
+                             for c in generic))
+
+    def test_finds_valid_json_document_blob_with_year(self):
+        js = '{"documentUrl": "/files/report-2024.pdf", "year": 2024}'
+        found = _extract_js_endpoint_candidates(js, "inline JS")
+        json_hits = [c for c in found if "JSON" in c["reason"]]
+        self.assertEqual(len(json_hits), 1)
+        self.assertEqual(json_hits[0]["raw_value"], "/files/report-2024.pdf")
+        self.assertEqual(json_hits[0]["_json_year"], 2024)
+
+    def test_no_candidates_in_unrelated_js(self):
+        js = "function toggleMenu() { document.getElementById('nav').classList.toggle('open'); }"
+        found = _extract_js_endpoint_candidates(js, "inline JS")
+        self.assertEqual(found, [])
+
+
+class TestParseJsonDocBlob(unittest.TestCase):
+    def test_valid_json_with_file_url_and_year(self):
+        blob = '{"fileUrl": "/x/report.pdf", "year": 2024}'
+        entry = _parse_json_doc_blob(blob, "inline JS")
+        self.assertEqual(entry["raw_value"], "/x/report.pdf")
+        self.assertEqual(entry["_json_year"], 2024)
+
+    def test_malformed_json_falls_back_to_regex(self):
+        # Trailing comma makes this invalid strict JSON.
+        blob = '{"pdfUrl": "/x/report-2024.pdf", "year": 2024,}'
+        entry = _parse_json_doc_blob(blob, "inline JS")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["raw_value"], "/x/report-2024.pdf")
+        self.assertEqual(entry["_json_year"], "2024")
+        self.assertIn("regex fallback", entry["reason"])
+
+    def test_no_document_field_returns_none(self):
+        blob = '{"title": "Careers", "year": 2024}'
+        self.assertIsNone(_parse_json_doc_blob(blob, "inline JS"))
+
+
+class TestClassifyEndpointCandidate(unittest.TestCase):
+    def test_api_path_with_keyword_is_high_confidence(self):
+        verdict = _classify_endpoint_candidate("/api/annual-reports/2024", "fetch call", 2024)
+        self.assertEqual(verdict, "HIGH_CONFIDENCE")
+
+    def test_pdf_url_with_matching_year_is_high_confidence(self):
+        verdict = _classify_endpoint_candidate("/files/report-2024.pdf", "", 2024)
+        self.assertEqual(verdict, "HIGH_CONFIDENCE")
+
+    def test_json_year_field_matching_target_is_high_confidence_even_without_year_in_url(self):
+        verdict = _classify_endpoint_candidate("/files/report.pdf", "", 2024, json_year=2024)
+        self.assertEqual(verdict, "HIGH_CONFIDENCE")
+
+    def test_json_year_field_not_matching_target_is_not_high_confidence(self):
+        verdict = _classify_endpoint_candidate("/files/report.pdf", "", 2024, json_year=2022)
+        self.assertNotEqual(verdict, "HIGH_CONFIDENCE")
+
+    def test_keyword_only_without_api_or_year_is_possible(self):
+        verdict = _classify_endpoint_candidate("/investor/publications", "some text", 2024)
+        self.assertEqual(verdict, "POSSIBLE")
+
+    def test_api_path_without_any_keyword_is_possible_not_high(self):
+        verdict = _classify_endpoint_candidate("/api/user/session", "", 2024)
+        self.assertEqual(verdict, "POSSIBLE")
+
+    def test_completely_unrelated_is_unrelated(self):
+        verdict = _classify_endpoint_candidate("/careers/apply", "Join our team", 2024)
+        self.assertEqual(verdict, "UNRELATED")
+
+
+class TestDiagnoseReportEndpoints(unittest.TestCase):
+    PAGE_URL = DIAGNOSTIC_REPORT_PAGE_CANDIDATES["sabic"]
+
+    def test_no_known_report_page_short_circuits_without_network(self):
+        buf = io.StringIO()
+        with patch("requests.get") as mock_get:
+            with redirect_stdout(buf):
+                result = diagnose_report_endpoints("yansab", 2024)
+        mock_get.assert_not_called()
+        self.assertEqual(result.get("error"), "no report page url")
+
+    def test_finds_high_confidence_json_endpoint_and_tests_it(self):
+        html = f'''
+        <html><body>
+          <p>SABIC Integrated Annual Report 2024</p>
+          <script>
+            fetch("/api/annual-reports/2024").then(r => r.json());
+          </script>
+          <a href="/careers/apply">Careers</a>
+        </body></html>
+        '''
+        api_url = urljoin(self.PAGE_URL, "/api/annual-reports/2024")
+        endpoint_json = json.dumps({"documentUrl": "/files/SABIC-2024.pdf", "year": 2024}).encode()
+
+        def fake_get(url, **kwargs):
+            if url == self.PAGE_URL:
+                return _fake_response(status_code=200, content=html.encode(), content_type="text/html", url=url)
+            if url == api_url:
+                return _fake_response(status_code=200, content=endpoint_json,
+                                       content_type="application/json", url=url)
+            raise AssertionError(f"unexpected URL requested: {url}")
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_report_endpoints("sabic", 2024)
+        output = buf.getvalue()
+
+        self.assertIn("CANDIDATE ENDPOINT", output)
+        self.assertIn("HIGH-CONFIDENCE REPORT ENDPOINT", output)
+        self.assertIn("POSSIBLE REPORT ENDPOINT", output)
+        self.assertIn("UNRELATED ENDPOINT", output)
+
+        self.assertEqual(len(result["endpoint_test_results"]), 1)
+        tested = result["endpoint_test_results"][0]
+        self.assertTrue(tested["is_json"])
+        self.assertEqual(tested["document_url_in_json"], "/files/SABIC-2024.pdf")
+        self.assertIn("/files/SABIC-2024.pdf", output)
+
+    def test_caps_endpoint_testing_at_three(self):
+        html_parts = ["<html><body>"]
+        api_urls = []
+        for i in range(5):
+            path = f"/api/annual-report-doc-{i}/2024"
+            html_parts.append(f'<script>fetch("{path}");</script>')
+            api_urls.append(urljoin(self.PAGE_URL, path))
+        html_parts.append("</body></html>")
+        html = "".join(html_parts)
+
+        call_count = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            if url == self.PAGE_URL:
+                return _fake_response(status_code=200, content=html.encode(), content_type="text/html", url=url)
+            call_count["n"] += 1
+            return _fake_response(status_code=200, content=b"<html></html>", content_type="text/html", url=url)
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_report_endpoints("sabic", 2024)
+        output = buf.getvalue()
+        self.assertEqual(call_count["n"], 3)
+        self.assertEqual(len(result["endpoint_test_results"]), 3)
+        self.assertIn("NOTE:", output)
+
+    def test_external_relevant_js_file_is_fetched_and_analyzed(self):
+        html = '''
+        <html><body>
+          <script src="/assets/annual-report-loader.js"></script>
+          <script src="/assets/main.bundle.js"></script>
+        </body></html>
+        '''
+        relevant_js_url = urljoin(self.PAGE_URL, "/assets/annual-report-loader.js")
+        irrelevant_js_url = urljoin(self.PAGE_URL, "/assets/main.bundle.js")
+        js_content = b'fetch("/api/annual-reports/2024");'
+
+        def fake_get(url, **kwargs):
+            if url == self.PAGE_URL:
+                return _fake_response(status_code=200, content=html.encode(), content_type="text/html", url=url)
+            if url == relevant_js_url:
+                return _fake_response(status_code=200, content=js_content,
+                                       content_type="application/javascript", url=url)
+            raise AssertionError(f"irrelevant JS file should never be fetched: {url}")
+
+        buf = io.StringIO()
+        with patch("requests.get", side_effect=fake_get):
+            with redirect_stdout(buf):
+                result = diagnose_report_endpoints("sabic", 2024)
+        self.assertEqual(result["external_js_files_fetched"], 1)
+        external_js_candidates = [c for c in result["candidates"] if c["source"] == "external JS"]
+        self.assertTrue(any(c["raw_value"] == "/api/annual-reports/2024" for c in external_js_candidates))
+
+    def test_no_high_confidence_endpoints_reports_no_reliable_path(self):
+        html = '<html><body><a href="/investor/publications">Publications</a></body></html>'
+        fake = _fake_response(status_code=200, content=html.encode(), content_type="text/html", url=self.PAGE_URL)
+        buf = io.StringIO()
+        with patch("requests.get", return_value=fake):
+            with redirect_stdout(buf):
+                diagnose_report_endpoints("sabic", 2024)
+        output = buf.getvalue()
+        self.assertIn("No reliable/verified path", output)
 
 
 class TestScriptDoesNotImportNetworkAtModuleLevel(unittest.TestCase):

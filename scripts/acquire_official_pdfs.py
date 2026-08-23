@@ -48,6 +48,7 @@ USAGE:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -654,6 +655,339 @@ def diagnose_report_page_links(company_slug: str, target_fiscal_year: int) -> di
     return result
 
 
+# --- Report-endpoint discovery (fetch/axios/XHR, JSON blobs, external JS) --
+# Goes further than diagnose_report_page_links(): also inspects inline
+# <script> contents, external <script src> files (fetched read-only, only
+# when their URL itself looks report-related, capped at 2), and JSON blobs
+# for fetch()/axios()/XMLHttpRequest calls and documentUrl/fileUrl-style
+# fields. Still: no Selenium/Playwright/browser automation, no new
+# dependency, no PDF download, no HTML/JS saved to disk, no registry or
+# acquisition-logic changes. Uses only the standard library.
+
+ENDPOINT_KEYWORDS = (
+    "annual", "report", "financial", "document", "download", "publication", "investor",
+)
+
+EXTERNAL_SCRIPT_SRC_PATTERN = re.compile(r'<script[^>]*\bsrc=["\']([^"\']+)["\']', re.IGNORECASE)
+INLINE_SCRIPT_PATTERN = re.compile(r'<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>', re.IGNORECASE | re.DOTALL)
+
+# fetch(...) / axios(...)/axios.get(...) / XMLHttpRequest.open('GET', ...)
+CALL_SITE_PATTERN = re.compile(
+    r'''(?:fetch|axios(?:\.\w+)?)\(\s*["']([^"']+)["']'''
+    r'''|\.open\(\s*["']GET["']\s*,\s*["']([^"']+)["']''',
+    re.IGNORECASE,
+)
+# Any quoted string (URL-shaped) containing a report/API keyword.
+GENERIC_ENDPOINT_URL_PATTERN = re.compile(
+    r'''["']((?:https?://|/)[^"']*(?:annual|report|financial|document|download|publication|investor|/api/)[^"']*)["']''',
+    re.IGNORECASE,
+)
+# Single-level (no nested braces) JSON-ish object containing a document-url field.
+JSON_OBJECT_WITH_DOC_FIELD_PATTERN = re.compile(
+    r'\{[^{}]*"(?:documentUrl|fileUrl|pdfUrl|reportUrl)"[^{}]*\}', re.IGNORECASE,
+)
+JSON_DOC_FIELD_KEYS = ("documentUrl", "fileUrl", "pdfUrl", "reportUrl")
+
+
+def _parse_json_doc_blob(blob: str, source_label: str) -> dict | None:
+    """Tries a strict json.loads() first; falls back to regex extraction for
+    the common real-world case of a JS object literal that isn't quite
+    valid JSON (unquoted keys, trailing commas). Returns a candidate dict
+    or None if no document-url field is found either way."""
+    try:
+        obj = json.loads(blob)
+    except Exception:
+        obj = None
+    if isinstance(obj, dict):
+        for key in JSON_DOC_FIELD_KEYS:
+            value = obj.get(key)
+            if isinstance(value, str):
+                year = obj.get("year")
+                reason = f'JSON object field "{key}"'
+                if year is not None:
+                    reason += f" (year field = {year!r})"
+                return {
+                    "source": source_label, "raw_value": value, "reason": reason,
+                    "context": blob[:200], "_json_year": year,
+                }
+        return None
+
+    key_match = re.search(r'"(documentUrl|fileUrl|pdfUrl|reportUrl)"\s*:\s*"([^"]+)"', blob, re.IGNORECASE)
+    if not key_match:
+        return None
+    year_match = re.search(r'"year"\s*:\s*"?(\d{4})"?', blob, re.IGNORECASE)
+    reason = f'JSON-like object field "{key_match.group(1)}" (regex fallback — strict JSON parse failed)'
+    if year_match:
+        reason += f" (year field = {year_match.group(1)!r})"
+    return {
+        "source": source_label, "raw_value": key_match.group(2), "reason": reason,
+        "context": blob[:200], "_json_year": year_match.group(1) if year_match else None,
+    }
+
+
+def _extract_js_endpoint_candidates(js_text: str, source_label: str) -> list[dict]:
+    """Pure function, no I/O: scans one block of JavaScript text (inline or
+    externally-fetched) for fetch/axios/XHR call sites, generic keyword URL
+    string literals, and JSON document-field blobs."""
+    found = []
+    for match in CALL_SITE_PATTERN.finditer(js_text):
+        url = next((g for g in match.groups() if g), None)
+        if not url:
+            continue
+        start, end = max(0, match.start() - 60), min(len(js_text), match.end() + 60)
+        found.append({
+            "source": source_label, "raw_value": url,
+            "reason": "found inside a fetch()/axios()/XMLHttpRequest.open() call",
+            "context": js_text[start:end],
+        })
+    for match in GENERIC_ENDPOINT_URL_PATTERN.finditer(js_text):
+        url = match.group(1)
+        start, end = max(0, match.start() - 60), min(len(js_text), match.end() + 60)
+        found.append({
+            "source": source_label, "raw_value": url,
+            "reason": "string literal containing a report/API keyword",
+            "context": js_text[start:end],
+        })
+    for match in JSON_OBJECT_WITH_DOC_FIELD_PATTERN.finditer(js_text):
+        entry = _parse_json_doc_blob(match.group(0), source_label)
+        if entry:
+            found.append(entry)
+    return found
+
+
+def _classify_endpoint_candidate(raw_value: str, context: str, target_fiscal_year: int,
+                                  json_year=None) -> str:
+    """HIGH_CONFIDENCE / POSSIBLE / UNRELATED — deliberately stricter than a
+    plain keyword match: an /api/ path or .pdf URL only counts as
+    HIGH_CONFIDENCE when it's also tied to the target fiscal year (via a
+    matching JSON "year" field or the year appearing in the URL/context),
+    or an /api/ path also carries a report/document keyword. A bare keyword
+    hit with none of that is POSSIBLE, not HIGH_CONFIDENCE — this is meant
+    to find the ACTUAL path SABIC uses, not just any link mentioning
+    "report"."""
+    if json_year is not None and str(json_year) == str(target_fiscal_year):
+        return "HIGH_CONFIDENCE"
+    haystack = f"{raw_value} {context}".lower()
+    has_year = str(target_fiscal_year) in haystack
+    is_api_path = "/api/" in raw_value.lower()
+    has_pdf = ".pdf" in raw_value.lower()
+    keyword_hits = [k for k in ENDPOINT_KEYWORDS if k in haystack]
+
+    if is_api_path and keyword_hits:
+        return "HIGH_CONFIDENCE"
+    if has_pdf and has_year:
+        return "HIGH_CONFIDENCE"
+    if keyword_hits or is_api_path or has_pdf:
+        return "POSSIBLE"
+    return "UNRELATED"
+
+
+def diagnose_report_endpoints(company_slug: str, target_fiscal_year: int) -> dict:
+    """Extends diagnose_report_page_links() with inline-script, external-JS,
+    and JSON-blob endpoint discovery, then tests (read-only, max 3 GETs,
+    no retries) only the HIGH-CONFIDENCE endpoints found. Never downloads
+    or saves a PDF, never saves HTML/JS to disk, never modifies any
+    registry or acquisition logic."""
+    report_page_url = DIAGNOSTIC_REPORT_PAGE_CANDIDATES.get(company_slug)
+    result = {
+        "company_slug": company_slug, "target_fiscal_year": target_fiscal_year,
+        "report_page_url": report_page_url,
+    }
+
+    print("=" * 78)
+    print(f"REPORT ENDPOINT DISCOVERY: {company_slug} — target FY{target_fiscal_year}")
+    print("=" * 78)
+
+    if not report_page_url:
+        print("No diagnostic report-index page known for this company; nothing to test.")
+        result["error"] = "no report page url"
+        return result
+
+    print(f"Fetching report-index page (1 GET request): {report_page_url}")
+    resp, elapsed, err = _timed_get(report_page_url, timeout=30, headers=BROWSER_LIKE_HEADERS)
+    result["page_elapsed_seconds"] = round(elapsed, 2)
+    if resp is None:
+        result["error"] = err
+        print(f"REQUEST FAILED after {result['page_elapsed_seconds']}s: {err}")
+        print("=" * 78)
+        return result
+
+    content_type = resp.headers.get("Content-Type", "unknown")
+    result["page_http_status"] = resp.status_code
+    result["page_content_type"] = content_type
+    print(f"HTTP status: {resp.status_code}  Content-Type: {content_type}  "
+          f"elapsed: {result['page_elapsed_seconds']}s")
+
+    if resp.status_code != 200 or "html" not in content_type.lower():
+        print("Response is not a 200 HTML page — nothing to parse.")
+        result["candidates"] = []
+        print("=" * 78)
+        return result
+
+    html_text = resp.text
+    base_url = resp.url
+    candidates: list[dict] = []
+
+    # HTML-level candidates already covered by extract_report_link_candidates
+    # (href / iframe / embed / object / data-attribute / inline js_reference).
+    source_label_map = {
+        "a_href": "HTML", "iframe_src": "HTML", "embed_src": "HTML", "object_data": "HTML",
+        "js_reference": "inline JS", "data_attribute": "data attribute",
+    }
+    for c in extract_report_link_candidates(html_text, base_url):
+        candidates.append({
+            "source": source_label_map.get(c["source"], c["source"]),
+            "raw_value": c["url"], "resolved_url": c["resolved_url"],
+            "reason": f"matched via {c['source']} pattern", "context": c["context"],
+        })
+
+    # Inline <script>...</script> contents.
+    for script_match in INLINE_SCRIPT_PATTERN.finditer(html_text):
+        for entry in _extract_js_endpoint_candidates(script_match.group(1), "inline JS"):
+            entry["resolved_url"] = urljoin(base_url, entry["raw_value"])
+            candidates.append(entry)
+
+    # External <script src="..."> files: always noted; only FETCHED
+    # (read-only, no save) when the src URL itself looks report-related,
+    # capped at 2 files to keep this bounded.
+    external_js_fetched = 0
+    for src_match in EXTERNAL_SCRIPT_SRC_PATTERN.finditer(html_text):
+        src = src_match.group(1)
+        resolved_src = urljoin(base_url, src)
+        candidates.append({
+            "source": "HTML", "raw_value": src, "resolved_url": resolved_src,
+            "reason": "external <script src> file reference", "context": src,
+        })
+        looks_relevant = any(kw in src.lower() for kw in ENDPOINT_KEYWORDS)
+        if looks_relevant and external_js_fetched < 2:
+            print(f"Fetching external JS file referenced by the page (read-only, not saved): {resolved_src}")
+            js_resp, js_elapsed, js_err = _timed_get(resolved_src, timeout=30, headers=BROWSER_LIKE_HEADERS)
+            external_js_fetched += 1
+            if js_resp is not None and js_resp.status_code == 200:
+                for entry in _extract_js_endpoint_candidates(js_resp.text, "external JS"):
+                    entry["resolved_url"] = urljoin(resolved_src, entry["raw_value"])
+                    candidates.append(entry)
+            elif js_resp is not None:
+                print(f"  external JS fetch returned HTTP {js_resp.status_code} — skipped analysis")
+            else:
+                print(f"  external JS fetch FAILED: {js_err}")
+    result["external_js_files_fetched"] = external_js_fetched
+
+    for c in candidates:
+        c["classification"] = _classify_endpoint_candidate(
+            c["raw_value"], c["context"], target_fiscal_year, c.get("_json_year"),
+        )
+
+    print()
+    for c in candidates:
+        print("CANDIDATE ENDPOINT")
+        print("------------------")
+        print(f"source: {c['source']}")
+        print(f"raw value: {c['raw_value']}")
+        print(f"resolved URL: {c['resolved_url']}")
+        print(f"reason: {c['reason']}")
+        print(f"context: {c['context'].strip()[:200]!r}")
+        print()
+
+    sections = (
+        ("HIGH-CONFIDENCE REPORT ENDPOINT", "HIGH_CONFIDENCE"),
+        ("POSSIBLE REPORT ENDPOINT", "POSSIBLE"),
+        ("UNRELATED ENDPOINT", "UNRELATED"),
+    )
+    for label, key in sections:
+        matches = [c for c in candidates if c["classification"] == key]
+        print(f"{label} ({len(matches)}):")
+        if not matches:
+            print("  (none found)")
+        for c in matches:
+            print(f"  [{c['source']}] {c['resolved_url']}  — {c['reason']}")
+        print()
+    result["candidates"] = candidates
+
+    # --- Network test phase: HIGH-CONFIDENCE endpoints only, max 3 GETs ----
+    seen_urls = set()
+    high_confidence = []
+    for c in candidates:
+        if c["classification"] == "HIGH_CONFIDENCE" and c["resolved_url"] not in seen_urls:
+            high_confidence.append(c)
+            seen_urls.add(c["resolved_url"])
+    to_test = high_confidence[:3]
+    if len(high_confidence) > 3:
+        skipped = [c["resolved_url"] for c in high_confidence[3:]]
+        print(f"NOTE: {len(high_confidence)} HIGH-CONFIDENCE endpoints found; testing only the "
+              f"first 3 per the fixed cap. Not tested: {skipped}")
+
+    print("=" * 78)
+    print(f"TESTING {len(to_test)} HIGH-CONFIDENCE ENDPOINT(S) (max 3, read-only, no retries)")
+    print("=" * 78)
+
+    endpoint_test_results = []
+    for c in to_test:
+        print(f"Testing: {c['resolved_url']}")
+        resp2, elapsed2, err2 = _timed_get(c["resolved_url"], timeout=30, headers=BROWSER_LIKE_HEADERS)
+        test_result = {"url": c["resolved_url"], "elapsed_seconds": round(elapsed2, 2)}
+        if resp2 is None:
+            test_result["error"] = err2
+            print(f"  REQUEST FAILED after {test_result['elapsed_seconds']}s: {err2}")
+            endpoint_test_results.append(test_result)
+            print()
+            continue
+
+        ct = resp2.headers.get("Content-Type", "unknown")
+        is_pdf = resp2.content[:5] == b"%PDF-"
+        is_json = "json" in ct.lower()
+        test_result.update({
+            "http_status": resp2.status_code, "content_type": ct,
+            "response_size_bytes": len(resp2.content), "final_url": resp2.url,
+            "redirect_count": len(resp2.history), "is_pdf": is_pdf, "is_json": is_json,
+        })
+        print(f"  HTTP status   : {resp2.status_code}")
+        print(f"  Content-Type  : {ct}")
+        print(f"  Response size : {test_result['response_size_bytes']} bytes")
+        print(f"  Elapsed       : {test_result['elapsed_seconds']}s")
+        print(f"  Final URL     : {resp2.url}")
+        print(f"  Redirect count: {test_result['redirect_count']}")
+        print(f"  Is PDF?       : {is_pdf}")
+        print(f"  Is JSON?      : {is_json}")
+
+        if is_pdf:
+            print("  NOT downloading/saving this PDF — diagnostic only.")
+        elif is_json:
+            try:
+                data = resp2.json()
+            except Exception as e:
+                data = None
+                print(f"  JSON parse failed: {e}")
+            if isinstance(data, dict):
+                doc_url = next((data[k] for k in JSON_DOC_FIELD_KEYS if isinstance(data.get(k), str)), None)
+                test_result["document_url_in_json"] = doc_url
+                test_result["year_in_json"] = data.get("year")
+                if doc_url:
+                    print(f"  Document URL found in JSON: {doc_url} (year field: {data.get('year')})")
+                else:
+                    print("  No documentUrl/fileUrl/pdfUrl/reportUrl field found in JSON.")
+            print(f"  Body snippet (500 chars): {resp2.text[:500]!r}")
+        elif "html" in ct.lower():
+            print(f"  Body snippet (500 chars): {resp2.text[:500]!r}")
+        endpoint_test_results.append(test_result)
+        print()
+    result["endpoint_test_results"] = endpoint_test_results
+
+    print("=" * 78)
+    print("CONCLUSION")
+    print("=" * 78)
+    reliable = next((tr for tr in endpoint_test_results
+                      if tr.get("is_pdf") or tr.get("document_url_in_json")), None)
+    if reliable:
+        found_url = reliable.get("document_url_in_json") or reliable["url"]
+        print(f"A reliable path to a real document was found: {found_url}")
+    else:
+        print(f"No reliable/verified path to the {company_slug} FY{target_fiscal_year} "
+              "report was confirmed by this diagnostic.")
+    print("=" * 78)
+    return result
+
+
 def run_full_acquisition() -> dict:
     """Runs acquire_reports() for every company, full FY2015-2024 range.
     acquire_reports()/acquire_one_report() already skip report_page and
@@ -730,6 +1064,15 @@ def main():
              "reference/data-attribute). Diagnostic only: no PDF download, "
              "no HTML saved to disk, no registry changes.",
     )
+    parser.add_argument(
+        "--diagnose-report-endpoints", nargs=2, metavar=("COMPANY_SLUG", "FISCAL_YEAR"),
+        help="Deeper report-index page investigation: inline <script> "
+             "content, external <script src> files (fetched read-only when "
+             "report-related, capped at 2), fetch()/axios()/XHR calls, and "
+             "JSON documentUrl/fileUrl-style blobs. Tests only HIGH-"
+             "CONFIDENCE endpoints found, max 3 GETs. No PDF download, no "
+             "HTML/JS saved to disk, no registry/acquisition-logic changes.",
+    )
     args = parser.parse_args()
 
     if args.diagnose_http:
@@ -748,6 +1091,15 @@ def main():
             print(f"Unknown company_slug: {slug!r}. Known: {sorted(COMPANY_SOURCE_REGISTRIES)}")
             sys.exit(1)
         diagnose_report_page_links(slug, fy)
+        return
+
+    if args.diagnose_report_endpoints:
+        slug, fy = args.diagnose_report_endpoints
+        fy = int(fy)
+        if slug not in COMPANY_SOURCE_REGISTRIES:
+            print(f"Unknown company_slug: {slug!r}. Known: {sorted(COMPANY_SOURCE_REGISTRIES)}")
+            sys.exit(1)
+        diagnose_report_endpoints(slug, fy)
         return
 
     if args.diagnose:
