@@ -106,7 +106,10 @@ def extract_from_bytes(pdf_bytes: bytes, ticker: str, fiscal_year: int) -> dict:
     candidates: list[dict] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page_count = len(pdf.pages)
+        print(f"[extract_from_bytes] opened PDF: {page_count} pages — starting page-by-page extraction...", flush=True)
         for i, page in enumerate(pdf.pages):
+            if i == 0 or (i + 1) % 10 == 0 or (i + 1) == page_count:
+                print(f"[extract_from_bytes] page {i + 1}/{page_count}...", flush=True)
             text = page.extract_text() or ""
             if not text:
                 continue

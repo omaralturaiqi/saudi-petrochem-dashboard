@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -86,7 +87,18 @@ def run(url: str, ticker: str, fiscal_year: int) -> dict | None:
     print("PDF magic bytes: valid (%PDF-)")
     print()
 
-    result = extract_from_bytes(pdf_bytes, ticker=ticker, fiscal_year=fiscal_year)
+    try:
+        result = extract_from_bytes(pdf_bytes, ticker=ticker, fiscal_year=fiscal_year)
+    except Exception as e:
+        print(f"EXTRACTION FAILED: {type(e).__name__}: {e}")
+        print("-" * 78)
+        print("TRACEBACK:")
+        traceback.print_exc(file=sys.stdout)
+        print("-" * 78)
+        print("=" * 78)
+        print("DRY-RUN ONLY — no PDF persisted, no database access, no database writes.")
+        print("=" * 78)
+        sys.exit(1)
     pdf_bytes = None  # discard — nothing else in this process retains the PDF bytes
 
     candidates = result["candidates"]
