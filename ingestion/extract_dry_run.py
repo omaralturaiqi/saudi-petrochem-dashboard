@@ -110,78 +110,96 @@ def extract_from_bytes(pdf_bytes: bytes, ticker: str, fiscal_year: int) -> dict:
         for i, page in enumerate(pdf.pages):
             if i == 0 or (i + 1) % 10 == 0 or (i + 1) == page_count:
                 print(f"[extract_from_bytes] page {i + 1}/{page_count}...", flush=True)
-            text = page.extract_text() or ""
-            if not text:
-                continue
-            lines = text.split("\n")
-            # Same 2-line sliding window as parser.py's extract_company(),
-            # reused verbatim so a wrapped label still matches its numbers.
-            windows2 = [
-                lines[j] + " " + lines[j + 1] if j + 1 < len(lines) else lines[j]
-                for j in range(len(lines))
-            ]
+            try:
+                text = page.extract_text() or ""
+                if not text:
+                    continue
+                lines = text.split("\n")
+                # Same 2-line sliding window as parser.py's extract_company(),
+                # reused verbatim so a wrapped label still matches its numbers.
+                windows2 = [
+                    lines[j] + " " + lines[j + 1] if j + 1 < len(lines) else lines[j]
+                    for j in range(len(lines))
+                ]
 
-            for concept, keyword_groups, stmt_type, require_any, exclude_any in CONCEPTS:
-                for line, window in zip(lines, windows2):
-                    line_lower = line.lower()
-                    window_lower = window.lower()
-                    if not line_matches(line_lower, keyword_groups):
-                        continue
-                    if require_any and not any(r in line_lower for r in require_any):
-                        continue
-                    if exclude_any and any(x in window_lower for x in exclude_any):
-                        continue
-                    raw_tokens = NUM_TOKEN_RE.findall(window)
-                    good_tokens = [t for t in raw_tokens if looks_like_financial_value(t)]
-                    if not good_tokens:
-                        continue
-                    parsed_vals = [parse_number(t) for t in good_tokens]
-                    parsed_vals = [v for v in parsed_vals if v is not None]
-                    if not parsed_vals:
-                        continue
+                for concept, keyword_groups, stmt_type, require_any, exclude_any in CONCEPTS:
+                    for line, window in zip(lines, windows2):
+                        line_lower = line.lower()
+                        window_lower = window.lower()
+                        if not line_matches(line_lower, keyword_groups):
+                            continue
+                        if require_any and not any(r in line_lower for r in require_any):
+                            continue
+                        if exclude_any and any(x in window_lower for x in exclude_any):
+                            continue
+                        raw_tokens = NUM_TOKEN_RE.findall(window)
+                        good_tokens = [t for t in raw_tokens if looks_like_financial_value(t)]
+                        if not good_tokens:
+                            continue
+                        parsed_vals = [parse_number(t) for t in good_tokens]
+                        parsed_vals = [v for v in parsed_vals if v is not None]
+                        if not parsed_vals:
+                            continue
 
-                    warnings: list[str] = []
-                    value_col1 = parsed_vals[0] if len(parsed_vals) > 0 else None
-                    value_col2 = parsed_vals[1] if len(parsed_vals) > 1 else None
-                    if value_col1 is not None and value_col2 is not None:
-                        # NEVER guess which column is the requested fiscal
-                        # year — both are preserved as-is, flagged instead.
-                        warnings.append(
-                            "multiple numeric columns; fiscal year column not disambiguated"
-                        )
-                    if len(parsed_vals) > 2:
-                        warnings.append(
-                            f"{len(parsed_vals)} numeric tokens found on this line/window; "
-                            "only the first two are captured as value_col1/value_col2 — "
-                            "additional values are not represented"
-                        )
+                        warnings: list[str] = []
+                        value_col1 = parsed_vals[0] if len(parsed_vals) > 0 else None
+                        value_col2 = parsed_vals[1] if len(parsed_vals) > 1 else None
+                        if value_col1 is not None and value_col2 is not None:
+                            # NEVER guess which column is the requested fiscal
+                            # year — both are preserved as-is, flagged instead.
+                            warnings.append(
+                                "multiple numeric columns; fiscal year column not disambiguated"
+                            )
+                        if len(parsed_vals) > 2:
+                            warnings.append(
+                                f"{len(parsed_vals)} numeric tokens found on this line/window; "
+                                "only the first two are captured as value_col1/value_col2 — "
+                                "additional values are not represented"
+                            )
 
-                    concept_known = concept in KNOWN_CONCEPT_KEYS
-                    if not concept_known:
-                        warnings.append(
-                            f"concept {concept!r} is not in the known/documented "
-                            "concept_dictionary set — kept, not discarded"
-                        )
+                        concept_known = concept in KNOWN_CONCEPT_KEYS
+                        if not concept_known:
+                            warnings.append(
+                                f"concept {concept!r} is not in the known/documented "
+                                "concept_dictionary set — kept, not discarded"
+                            )
 
-                    confidence = "MEDIUM" if len(parsed_vals) <= 3 else "LOW"
+                        confidence = "MEDIUM" if len(parsed_vals) <= 3 else "LOW"
 
-                    candidates.append({
-                        "ticker": ticker,
-                        "fiscal_year": fiscal_year,
-                        "statement_type": stmt_type,
-                        "concept": concept,
-                        "concept_known": concept_known,
-                        "reported_label": window.strip()[:90],
-                        "value_col1": value_col1,
-                        "value_col2": value_col2,
-                        "currency": "SAR",
-                        "unit": "thousand",
-                        "source_page": i + 1,
-                        "extraction_method": "pdfplumber_text_keyword_v2_dry_run",
-                        "confidence": confidence,
-                        "raw_text": window.strip()[:150],
-                        "warnings": warnings,
-                    })
+                        candidates.append({
+                            "ticker": ticker,
+                            "fiscal_year": fiscal_year,
+                            "statement_type": stmt_type,
+                            "concept": concept,
+                            "concept_known": concept_known,
+                            "reported_label": window.strip()[:90],
+                            "value_col1": value_col1,
+                            "value_col2": value_col2,
+                            "currency": "SAR",
+                            "unit": "thousand",
+                            "source_page": i + 1,
+                            "extraction_method": "pdfplumber_text_keyword_v2_dry_run",
+                            "confidence": confidence,
+                            "raw_text": window.strip()[:150],
+                            "warnings": warnings,
+                        })
+                del text, lines, windows2
+            finally:
+                # Bound memory to ~1 page at a time. pdfplumber.PDF.pages
+                # (see pdfplumber/pdf.py) keeps every Page wrapper alive for
+                # the life of this `with` block, and page.extract_text()
+                # lazily populates that Page's cached parsed content (chars,
+                # rects, lines, curves, images, layout — see
+                # pdfplumber/container.py Container.cached_properties and
+                # Page.cached_properties) which is never cleared
+                # automatically. Without this call, those caches accumulate
+                # across every page processed so far instead of being
+                # released once we're done with each page. page.close() is
+                # pdfplumber's own public cleanup method for exactly this
+                # (it calls flush_cache() and clears the get_textmap
+                # lru_cache) — not a workaround, the intended API for
+                # bounding memory across a page loop.
+                page.close()
 
     # Duplicate detection: surfaced via a warning on every affected
     # candidate — never merged, never overwritten, every occurrence kept.

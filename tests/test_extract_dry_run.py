@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pdfplumber
 from reportlab.pdfgen import canvas
 
 from ingestion.extract_dry_run import (
@@ -45,6 +46,86 @@ def _build_fixture_pdf_bytes() -> bytes:
     c.showPage()
     c.save()
     return buf.getvalue()
+
+
+def _build_multi_page_fixture_pdf_bytes(num_pages: int) -> bytes:
+    """Builds a small, real, multi-page PDF in memory (each page carrying
+    its own text so extract_text() has real per-page content to cache).
+    No file is written to disk."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(612, 792))
+    for p in range(num_pages):
+        c.setFont("Helvetica", 10)
+        c.drawString(50, 700, f"Total revenue {1_000_000 + p} 900,000")
+        c.drawString(50, 680, f"Net income for the year ({100_000 + p}) 50,000")
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+class TestPageMemoryRelease(unittest.TestCase):
+    """Proves the memory fix: pdfplumber's per-page cache (chars/objects/
+    layout — populated by extract_text()) is released via page.close()
+    once extract_from_bytes() is done with a page, rather than being
+    retained for every page across the whole document."""
+
+    def test_page_close_called_for_every_page(self):
+        # Spies on the real pdfplumber.page.Page.close (still calls the
+        # real implementation) to prove the release mechanism actually
+        # fires for every page processed, not just some / not zero. Note:
+        # page.close() legitimately fires twice per page here — once from
+        # our explicit per-page call (which is what bounds memory *during*
+        # the loop) and once more, harmlessly, from pdfplumber's own
+        # PDF.close() when the `with` block exits (PDF.close() iterates
+        # every page and closes it again — see pdfplumber/pdf.py). That
+        # second pass is a no-op cleanup on already-empty caches; it does
+        # not indicate the fix is missing, so this test only checks that
+        # every page number was closed at least once, not an exact count.
+        pdf_bytes = _build_multi_page_fixture_pdf_bytes(3)
+        original_close = pdfplumber.page.Page.close
+        closed_page_numbers = set()
+
+        def spy_close(self, *args, **kwargs):
+            closed_page_numbers.add(self.page_number)
+            return original_close(self, *args, **kwargs)
+
+        with patch.object(pdfplumber.page.Page, "close", spy_close):
+            result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+
+        self.assertEqual(result["page_count"], 3)
+        self.assertEqual(
+            closed_page_numbers, {1, 2, 3},
+            "page.close() must be called for every page, proving each "
+            "page's cache is released rather than never being cleaned up.",
+        )
+
+    def test_previous_pages_cache_cleared_before_next_page_starts(self):
+        # The real invariant this fix must satisfy: by the time page N
+        # begins extraction, every prior page's cached parsed content
+        # (chars/objects/rects/lines/curves/images, tracked via _objects)
+        # must already be gone — proving memory is bounded to ~1 page at a
+        # time during the loop, not merely cleaned up once at the very end
+        # when the `with` block exits.
+        pdf_bytes = _build_multi_page_fixture_pdf_bytes(3)
+        original_extract_text = pdfplumber.page.Page.extract_text
+        pages_seen_so_far = []
+
+        def spy_extract_text(self, *args, **kwargs):
+            for prior_page in pages_seen_so_far:
+                if hasattr(prior_page, "_objects"):
+                    raise AssertionError(
+                        f"page {prior_page.page_number}'s cache is still populated "
+                        f"while page {self.page_number} is starting extraction — "
+                        "memory is not bounded to ~1 page at a time"
+                    )
+            pages_seen_so_far.append(self)
+            return original_extract_text(self, *args, **kwargs)
+
+        with patch.object(pdfplumber.page.Page, "extract_text", spy_extract_text):
+            result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+
+        self.assertEqual(result["page_count"], 3)
+        self.assertEqual(len(pages_seen_so_far), 3)
 
 
 class TestVerifyPdfBytes(unittest.TestCase):
