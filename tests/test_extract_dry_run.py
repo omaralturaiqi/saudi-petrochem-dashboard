@@ -26,6 +26,7 @@ from ingestion.extract_dry_run import (
     extract_from_bytes,
     verify_pdf_bytes,
 )
+from scripts.dry_run_extract import build_arg_parser, run as script_run
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_RAW_ROOT = REPO_ROOT / "data" / "raw"
@@ -126,6 +127,144 @@ class TestPageMemoryRelease(unittest.TestCase):
 
         self.assertEqual(result["page_count"], 3)
         self.assertEqual(len(pages_seen_so_far), 3)
+
+
+class TestPageRangeDiagnostic(unittest.TestCase):
+    """Proves the --start-page/--end-page diagnostic capability: default
+    behavior is unchanged, a supplied range restricts processing to exactly
+    those pages (without extracting text for any other page), invalid
+    ranges fail cleanly, and all existing guarantees (page.close() cleanup,
+    no DB, no filesystem writes) still hold when a range is used."""
+
+    def test_default_behavior_processes_full_document(self):
+        # (1) Omitting start_page/end_page must process every page — the
+        # exact original, range-less behavior.
+        pdf_bytes = _build_multi_page_fixture_pdf_bytes(4)
+        result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        self.assertEqual(result["page_count"], 4)
+        self.assertEqual(
+            {c["source_page"] for c in result["candidates"]}, {1, 2, 3, 4},
+            "every page must produce candidates when no range is supplied",
+        )
+
+    def test_cli_start_end_page_parsed_correctly(self):
+        # (2) --start-page/--end-page are recognized CLI arguments, parsed
+        # as ints, and default to None (meaning "unrestricted") when
+        # omitted — proving the CLI surface itself, independent of
+        # extract_from_bytes.
+        parser = build_arg_parser()
+        args = parser.parse_args(["--start-page", "50", "--end-page", "60"])
+        self.assertEqual(args.start_page, 50)
+        self.assertEqual(args.end_page, 60)
+
+        args_default = parser.parse_args([])
+        self.assertIsNone(args_default.start_page)
+        self.assertIsNone(args_default.end_page)
+
+    def test_small_range_processes_only_requested_pages(self):
+        # (3) A supplied range must restrict BOTH the returned candidates
+        # AND which pages are ever text-extracted at all — proven via a
+        # spy on Page.extract_text, not just by checking the output.
+        pdf_bytes = _build_multi_page_fixture_pdf_bytes(5)
+        original_extract_text = pdfplumber.page.Page.extract_text
+        extracted_page_numbers = []
+
+        def spy_extract_text(self, *args, **kwargs):
+            extracted_page_numbers.append(self.page_number)
+            return original_extract_text(self, *args, **kwargs)
+
+        with patch.object(pdfplumber.page.Page, "extract_text", spy_extract_text):
+            result = extract_from_bytes(
+                pdf_bytes, ticker="2010", fiscal_year=2024, start_page=2, end_page=3,
+            )
+
+        self.assertEqual(result["page_count"], 5, "page_count must still report the real document size")
+        self.assertEqual(
+            sorted(extracted_page_numbers), [2, 3],
+            "extract_text() must be called only for pages within the requested range",
+        )
+        self.assertEqual(
+            {c["source_page"] for c in result["candidates"]}, {2, 3},
+            "candidates must come only from pages within the requested range",
+        )
+
+    def test_invalid_range_raises_valueerror(self):
+        # (4) Invalid ranges (relative to the real page count) must fail
+        # cleanly with a clear, descriptive error rather than silently
+        # clamping or producing wrong results.
+        pdf_bytes = _build_multi_page_fixture_pdf_bytes(3)
+
+        with self.assertRaises(ValueError):
+            extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024, start_page=5, end_page=3)  # start > end
+        with self.assertRaises(ValueError):
+            extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024, start_page=1, end_page=99)  # beyond page_count
+        with self.assertRaises(ValueError):
+            extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024, start_page=0, end_page=2)  # below 1
+
+    def test_invalid_range_cli_fails_cleanly_with_nonzero_exit_before_fetch(self):
+        # (4, CLI level) An obviously-malformed range (start > end, or < 1)
+        # must be rejected by scripts/dry_run_extract.py's run() with a
+        # non-zero exit code BEFORE any network fetch is attempted — proven
+        # by patching requests.get to raise if it's ever called.
+        with patch("requests.get", side_effect=AssertionError("requests.get must not be called for an invalid range")):
+            with self.assertRaises(SystemExit) as ctx:
+                script_run(
+                    url="https://example.invalid/never-fetched.pdf",
+                    ticker="2010", fiscal_year=2024,
+                    start_page=10, end_page=5,  # start > end
+                )
+            self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_page_close_called_for_every_page_in_range(self):
+        # (5) page.close() cleanup must still fire for every page actually
+        # processed when a range is supplied. Note: pdfplumber's own
+        # PDF.close() (invoked when the `with` block exits) also closes
+        # every page in pdf.pages, including pages 1 and 5 which are
+        # outside this range — that's a harmless no-op cleanup on pages
+        # that were never text-extracted at all (see
+        # test_small_range_processes_only_requested_pages, which proves
+        # extract_text() is never called for out-of-range pages). So this
+        # test checks that the in-range pages are covered, not that the
+        # closed set is limited to exactly the range.
+        pdf_bytes = _build_multi_page_fixture_pdf_bytes(5)
+        original_close = pdfplumber.page.Page.close
+        closed_page_numbers = set()
+
+        def spy_close(self, *args, **kwargs):
+            closed_page_numbers.add(self.page_number)
+            return original_close(self, *args, **kwargs)
+
+        with patch.object(pdfplumber.page.Page, "close", spy_close):
+            extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024, start_page=2, end_page=4)
+
+        self.assertTrue(
+            {2, 3, 4}.issubset(closed_page_numbers),
+            "page.close() must be called for every page within the requested range "
+            f"(got {sorted(closed_page_numbers)})",
+        )
+
+    def test_ranged_extraction_has_no_db_imports_and_no_filesystem_writes(self):
+        # (6) Existing read-only/in-memory guarantees must hold when a
+        # range is supplied too — no write-mode open() call anywhere in
+        # the call graph, and no new files under data/raw/.
+        import builtins
+        real_open = builtins.open
+
+        def guarded_open(file, mode="r", *args, **kwargs):
+            if any(m in mode for m in ("w", "a", "x")):
+                raise AssertionError(f"unexpected write-mode open() call: {file!r} mode={mode!r}")
+            return real_open(file, mode, *args, **kwargs)
+
+        before = set(DATA_RAW_ROOT.rglob("*")) if DATA_RAW_ROOT.exists() else set()
+        pdf_bytes = _build_multi_page_fixture_pdf_bytes(3)
+        with patch("builtins.open", side_effect=guarded_open):
+            extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024, start_page=1, end_page=2)
+        after = set(DATA_RAW_ROOT.rglob("*")) if DATA_RAW_ROOT.exists() else set()
+        self.assertEqual(before, after)
+        # The no-DB-import AST check already covers both files' full source
+        # (see TestNoDatabaseImports) — that check is source-level and does
+        # not need to be re-run per code path, since it verifies no such
+        # import statement exists anywhere in either file at all.
 
 
 class TestVerifyPdfBytes(unittest.TestCase):

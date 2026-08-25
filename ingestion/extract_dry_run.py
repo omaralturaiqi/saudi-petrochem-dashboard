@@ -84,10 +84,27 @@ def verify_pdf_bytes(pdf_bytes: bytes) -> None:
         )
 
 
-def extract_from_bytes(pdf_bytes: bytes, ticker: str, fiscal_year: int) -> dict:
+def extract_from_bytes(
+    pdf_bytes: bytes,
+    ticker: str,
+    fiscal_year: int,
+    start_page: int | None = None,
+    end_page: int | None = None,
+) -> dict:
     """READ-ONLY, in-memory extraction. Never writes a file (uses
     io.BytesIO, not a temp file), never imports any database code, never
     persists pdf_bytes anywhere beyond this function's own local scope.
+
+    start_page/end_page (both optional, 1-based, inclusive) restrict
+    processing to a page range — a diagnostic aid for isolating which page
+    of a large document is causing a failure. Defaults (None/None) process
+    every page, matching the original, unrestricted behavior exactly.
+    Pages outside the requested range are never text-extracted at all (no
+    page.extract_text() call for them), so the full document's extracted
+    text is never held in memory regardless of range size.
+
+    Raises ValueError if the requested range is invalid for this document
+    (e.g. start_page > end_page, or end_page beyond the real page count).
 
     Returns:
       {
@@ -106,10 +123,33 @@ def extract_from_bytes(pdf_bytes: bytes, ticker: str, fiscal_year: int) -> dict:
     candidates: list[dict] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page_count = len(pdf.pages)
-        print(f"[extract_from_bytes] opened PDF: {page_count} pages — starting page-by-page extraction...", flush=True)
+
+        # Resolve the requested range against the real page count. None on
+        # either end means "use the document's actual bound" — this is
+        # exactly what makes the no-args-supplied case behave identically
+        # to the original, range-less implementation.
+        range_start = 1 if start_page is None else start_page
+        range_end = page_count if end_page is None else end_page
+        if range_start < 1 or range_end < 1 or range_start > range_end or range_end > page_count:
+            raise ValueError(
+                f"invalid page range: start_page={start_page!r}, end_page={end_page!r} "
+                f"for a document with {page_count} pages (valid range is 1..{page_count} "
+                "inclusive, with start <= end)"
+            )
+
+        print(
+            f"[extract_from_bytes] processing pages {range_start}-{range_end} of {page_count}...",
+            flush=True,
+        )
         for i, page in enumerate(pdf.pages):
-            if i == 0 or (i + 1) % 10 == 0 or (i + 1) == page_count:
-                print(f"[extract_from_bytes] page {i + 1}/{page_count}...", flush=True)
+            page_number = i + 1
+            if page_number < range_start or page_number > range_end:
+                # Outside the requested range — skip entirely. extract_text()
+                # is never called for this page, so its text is never parsed
+                # or held in memory.
+                continue
+            if page_number == range_start or page_number % 10 == 0 or page_number == range_end:
+                print(f"[extract_from_bytes] page {page_number}/{page_count}...", flush=True)
             try:
                 text = page.extract_text() or ""
                 if not text:
@@ -177,7 +217,7 @@ def extract_from_bytes(pdf_bytes: bytes, ticker: str, fiscal_year: int) -> dict:
                             "value_col2": value_col2,
                             "currency": "SAR",
                             "unit": "thousand",
-                            "source_page": i + 1,
+                            "source_page": page_number,
                             "extraction_method": "pdfplumber_text_keyword_v2_dry_run",
                             "confidence": confidence,
                             "raw_text": window.strip()[:150],

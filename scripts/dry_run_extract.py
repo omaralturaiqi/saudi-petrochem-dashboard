@@ -20,8 +20,13 @@ DOES NOT:
 
 USAGE:
     python3 scripts/dry_run_extract.py
-        # uses the default (verified SABIC FY2024) URL/ticker/fiscal-year
+        # uses the default (verified SABIC FY2024) URL/ticker/fiscal-year,
+        # processing every page (identical to omitting --start-page/--end-page)
     python3 scripts/dry_run_extract.py --url URL --ticker TICKER --fiscal-year YYYY
+    python3 scripts/dry_run_extract.py --start-page 50 --end-page 60
+        # DIAGNOSTIC ONLY: process just pages 50-60 (1-based, inclusive) of
+        # the same document, to isolate which page a failure occurs on.
+        # The PDF is still downloaded and opened normally either way.
 """
 from __future__ import annotations
 
@@ -47,7 +52,13 @@ DEFAULT_TICKER = "2010"
 DEFAULT_FISCAL_YEAR = 2024
 
 
-def run(url: str, ticker: str, fiscal_year: int) -> dict | None:
+def run(
+    url: str,
+    ticker: str,
+    fiscal_year: int,
+    start_page: int | None = None,
+    end_page: int | None = None,
+) -> dict | None:
     import requests  # local import — keeps module import itself side-effect-free
 
     print("=" * 78)
@@ -56,7 +67,34 @@ def run(url: str, ticker: str, fiscal_year: int) -> dict | None:
     print(f"URL          : {url}")
     print(f"Ticker       : {ticker}")
     print(f"Fiscal year  : {fiscal_year}")
+    if start_page is not None or end_page is not None:
+        print(f"Page range   : {start_page if start_page is not None else 1}"
+              f"-{end_page if end_page is not None else '(last)'} (diagnostic subset)")
     print()
+
+    # Cheap, pre-fetch sanity checks on the requested range — these don't
+    # need the document's real page count, so fail immediately rather than
+    # downloading a large PDF first just to reject an obviously-malformed
+    # range. Full validation against the real page count still happens
+    # inside extract_from_bytes(), which is the only place that knows it.
+    if start_page is not None and start_page < 1:
+        print(f"INVALID PAGE RANGE: --start-page must be >= 1, got {start_page}")
+        print("=" * 78)
+        print("DRY-RUN ONLY — no PDF persisted, no database access, no database writes.")
+        print("=" * 78)
+        sys.exit(2)
+    if end_page is not None and end_page < 1:
+        print(f"INVALID PAGE RANGE: --end-page must be >= 1, got {end_page}")
+        print("=" * 78)
+        print("DRY-RUN ONLY — no PDF persisted, no database access, no database writes.")
+        print("=" * 78)
+        sys.exit(2)
+    if start_page is not None and end_page is not None and start_page > end_page:
+        print(f"INVALID PAGE RANGE: --start-page ({start_page}) must be <= --end-page ({end_page})")
+        print("=" * 78)
+        print("DRY-RUN ONLY — no PDF persisted, no database access, no database writes.")
+        print("=" * 78)
+        sys.exit(2)
 
     try:
         resp = requests.get(url, timeout=60)
@@ -88,7 +126,10 @@ def run(url: str, ticker: str, fiscal_year: int) -> dict | None:
     print()
 
     try:
-        result = extract_from_bytes(pdf_bytes, ticker=ticker, fiscal_year=fiscal_year)
+        result = extract_from_bytes(
+            pdf_bytes, ticker=ticker, fiscal_year=fiscal_year,
+            start_page=start_page, end_page=end_page,
+        )
     except Exception as e:
         print(f"EXTRACTION FAILED: {type(e).__name__}: {e}")
         print("-" * 78)
@@ -141,13 +182,29 @@ def run(url: str, ticker: str, fiscal_year: int) -> dict | None:
     return result
 
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--url", default=DEFAULT_SABIC_FY2024_URL)
     cli.add_argument("--ticker", default=DEFAULT_TICKER)
     cli.add_argument("--fiscal-year", type=int, default=DEFAULT_FISCAL_YEAR)
+    cli.add_argument(
+        "--start-page", type=int, default=None,
+        help="DIAGNOSTIC ONLY: 1-based inclusive page to start processing from "
+             "(default: page 1 — i.e. the whole document, identical to omitting this flag)",
+    )
+    cli.add_argument(
+        "--end-page", type=int, default=None,
+        help="DIAGNOSTIC ONLY: 1-based inclusive page to stop processing at "
+             "(default: the document's last page — i.e. the whole document, "
+             "identical to omitting this flag)",
+    )
+    return cli
+
+
+def main():
+    cli = build_arg_parser()
     args = cli.parse_args()
-    run(args.url, args.ticker, args.fiscal_year)
+    run(args.url, args.ticker, args.fiscal_year, args.start_page, args.end_page)
 
 
 if __name__ == "__main__":
