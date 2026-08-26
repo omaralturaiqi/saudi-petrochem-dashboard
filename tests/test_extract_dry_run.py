@@ -64,6 +64,171 @@ def _build_multi_page_fixture_pdf_bytes(num_pages: int) -> bytes:
     return buf.getvalue()
 
 
+def _build_two_column_fixture_pdf_bytes() -> bytes:
+    """Builds a synthetic, real, single-page, TWO-COLUMN PDF: a left-column
+    financial table (header row with year tokens, a data row with values
+    explicitly positioned under each year column) plus a right-column
+    narrative sentence sharing the same y-position as the data row, that
+    independently mentions the same concept/number/year in prose. No real
+    document values used. Landscape-ish width (792pt) with a >100pt gap
+    between the two columns so _detect_column_boundary() finds a real
+    gutter."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(792, 612))
+    c.setFont("Helvetica", 10)
+    # Left column (financial table): header row with year tokens.
+    c.drawString(200, 560, "2024")
+    c.drawString(260, 560, "2023")
+    # Left column data row, values explicitly aligned under their year.
+    c.drawString(50, 540, "Total")
+    c.drawString(80, 540, "revenue")
+    c.drawString(200, 540, "100.00")   # aligned under "2024"
+    c.drawString(260, 540, "90.00")    # aligned under "2023"
+    # Right column narrative sentence, SAME top as the data row (y=540) —
+    # the exact scenario that merged unrelated columns in the real SABIC
+    # diagnostic. Independently contains the concept keyword, a number,
+    # and a year — if this were captured as its own candidate, or merged
+    # into the left row's window, the fix would not be working.
+    c.drawString(460, 540, "Total revenue reached 100.00 in 2024 driven by volumes.")
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _build_duplicate_table_fixture_pdf_bytes() -> bytes:
+    """Builds a synthetic, real, single-page PDF with TWO separate,
+    vertically-stacked table blocks (each with its own year-header row),
+    both containing a net_income match at different magnitudes — modeling
+    the real SABIC evidence of the same concept label appearing in what
+    looks like a primary table and a separate (e.g. currency-converted)
+    duplicate table on the same page. Single-column (no x-gap needed;
+    table-block separation here is by y-position / header re-detection,
+    not by column)."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(612, 792))
+    c.setFont("Helvetica", 10)
+    # Table block 1.
+    c.drawString(200, 560, "2024")
+    c.drawString(260, 560, "2023")
+    c.drawString(50, 540, "Net")
+    c.drawString(80, 540, "income")
+    c.drawString(110, 540, "for")
+    c.drawString(130, 540, "the")
+    c.drawString(150, 540, "year")
+    c.drawString(200, 540, "500.00")   # aligned under block 1's "2024"
+    c.drawString(260, 540, "450.00")   # aligned under block 1's "2023"
+    # Table block 2 — far enough below (80pt) to be a clearly separate row
+    # cluster, with its own fresh year-header row.
+    c.drawString(200, 460, "2024")
+    c.drawString(260, 460, "2023")
+    c.drawString(50, 440, "Net")
+    c.drawString(80, 440, "income")
+    c.drawString(110, 440, "for")
+    c.drawString(130, 440, "the")
+    c.drawString(150, 440, "year")
+    c.drawString(200, 440, "130.00")   # aligned under block 2's "2024"
+    c.drawString(260, 440, "120.00")   # aligned under block 2's "2023"
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+class TestCoordinateAwareExtraction(unittest.TestCase):
+    """Proves the coordinate-aware rework's specific new behaviors, using
+    synthetic (non-SABIC) two-column and duplicate-table fixtures modeled
+    on the structural patterns confirmed in the real SABIC FY2024
+    diagnostic evidence (cross-column row merging; same concept label
+    appearing in two distinct table blocks at different magnitudes)."""
+
+    def test_two_column_page_narrative_is_not_merged_or_captured(self):
+        # Requirement: narrative sentences that merely repeat a financial
+        # figure must not become financial candidates, and two-column page
+        # content must not be cross-merged into one row.
+        pdf_bytes = _build_two_column_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        revenue_candidates = [c for c in result["candidates"] if c["concept"] == "revenue"]
+        self.assertEqual(
+            len(revenue_candidates), 1,
+            "exactly one revenue candidate expected: the left-column table row only "
+            "— the right-column narrative sentence must not produce its own candidate "
+            "and must not be merged into the table row's window",
+        )
+        candidate = revenue_candidates[0]
+        # If the narrative sentence's trailing prose ("driven by volumes.")
+        # had leaked into this candidate's window, raw_text would contain it.
+        self.assertNotIn("driven by volumes", candidate["raw_text"])
+        self.assertNotIn("reached", candidate["raw_text"])
+
+    def test_2024_value_explicitly_mapped_via_column_position(self):
+        # Requirement: bind numeric tokens to the correct year column using
+        # x-position alignment rather than assuming the first value found
+        # is the target year. Here "90.00" (2023) is positioned BEFORE
+        # "100.00" (2024) would be if this were purely reading-order, but
+        # both are drawn in the same left-to-right order as their headers
+        # (2024 then 2023) — the test asserts the binding is explicitly
+        # tied to header x-position, not merely "first token found".
+        pdf_bytes = _build_two_column_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        revenue_candidates = [c for c in result["candidates"] if c["concept"] == "revenue"]
+        self.assertEqual(len(revenue_candidates), 1)
+        candidate = revenue_candidates[0]
+        self.assertEqual(candidate["requested_year_value"], 100.00,
+                          "the value aligned under the '2024' header must be explicitly mapped")
+        self.assertEqual(candidate["mapped_year_values"].get(2024), 100.00)
+        self.assertEqual(candidate["mapped_year_values"].get(2023), 90.00)
+        # Once coordinate binding resolves the requested year, the old
+        # "not disambiguated" warning (which only applies when binding
+        # could not resolve it) must not be present.
+        self.assertFalse(
+            any("not disambiguated" in w for w in candidate["warnings"]),
+            "a coordinate-resolved requested_year_value must not also carry the "
+            "unresolved-ambiguity warning",
+        )
+
+    def test_2023_value_cannot_silently_become_the_2024_value(self):
+        # Requesting fiscal_year=2023 against the SAME fixture must resolve
+        # to the DIFFERENT value aligned under the "2023" header, proving
+        # the binding is genuinely year-specific, not a fixed "first/second
+        # token" positional assumption that would return the same number
+        # regardless of which year was requested.
+        pdf_bytes = _build_two_column_fixture_pdf_bytes()
+        result_2024 = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        result_2023 = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2023)
+        value_2024 = [c for c in result_2024["candidates"] if c["concept"] == "revenue"][0]["requested_year_value"]
+        value_2023 = [c for c in result_2023["candidates"] if c["concept"] == "revenue"][0]["requested_year_value"]
+        self.assertEqual(value_2024, 100.00)
+        self.assertEqual(value_2023, 90.00)
+        self.assertNotEqual(value_2024, value_2023)
+
+    def test_duplicate_table_blocks_kept_distinct_and_flagged(self):
+        # Requirement: SAR and duplicate (e.g. USD) tables where the same
+        # concept label appears at different magnitudes must not be
+        # confused/merged — both candidates must be kept, each correctly
+        # bound to ITS OWN table block's year columns, and both flagged
+        # that a duplicate table block was found for this concept.
+        pdf_bytes = _build_duplicate_table_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        net_income_candidates = [c for c in result["candidates"] if c["concept"] == "net_income"]
+        self.assertEqual(len(net_income_candidates), 2, "both table blocks must produce a separate candidate")
+
+        table_indexes = {c["table_index"] for c in net_income_candidates}
+        self.assertEqual(len(table_indexes), 2, "the two candidates must carry distinct table_index values")
+
+        requested_year_values = {c["requested_year_value"] for c in net_income_candidates}
+        self.assertEqual(
+            requested_year_values, {500.00, 130.00},
+            "each candidate's requested_year_value must come from its OWN table block "
+            "(500.00 from block 1, 130.00 from block 2) — never cross-contaminated",
+        )
+
+        for c in net_income_candidates:
+            self.assertTrue(
+                any("distinct table" in w for w in c["warnings"]),
+                "every candidate sharing this concept across >1 table block on the same "
+                "page must be flagged for human review, not silently merged or trusted",
+            )
+
+
 class TestPageMemoryRelease(unittest.TestCase):
     """Proves the memory fix: pdfplumber's per-page cache (chars/objects/
     layout — populated by extract_text()) is released via page.close()
@@ -108,10 +273,10 @@ class TestPageMemoryRelease(unittest.TestCase):
         # time during the loop, not merely cleaned up once at the very end
         # when the `with` block exits.
         pdf_bytes = _build_multi_page_fixture_pdf_bytes(3)
-        original_extract_text = pdfplumber.page.Page.extract_text
+        original_extract_words = pdfplumber.page.Page.extract_words
         pages_seen_so_far = []
 
-        def spy_extract_text(self, *args, **kwargs):
+        def spy_extract_words(self, *args, **kwargs):
             for prior_page in pages_seen_so_far:
                 if hasattr(prior_page, "_objects"):
                     raise AssertionError(
@@ -120,9 +285,9 @@ class TestPageMemoryRelease(unittest.TestCase):
                         "memory is not bounded to ~1 page at a time"
                     )
             pages_seen_so_far.append(self)
-            return original_extract_text(self, *args, **kwargs)
+            return original_extract_words(self, *args, **kwargs)
 
-        with patch.object(pdfplumber.page.Page, "extract_text", spy_extract_text):
+        with patch.object(pdfplumber.page.Page, "extract_words", spy_extract_words):
             result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
 
         self.assertEqual(result["page_count"], 3)
@@ -163,17 +328,17 @@ class TestPageRangeDiagnostic(unittest.TestCase):
 
     def test_small_range_processes_only_requested_pages(self):
         # (3) A supplied range must restrict BOTH the returned candidates
-        # AND which pages are ever text-extracted at all — proven via a
-        # spy on Page.extract_text, not just by checking the output.
+        # AND which pages are ever word-extracted at all — proven via a
+        # spy on Page.extract_words, not just by checking the output.
         pdf_bytes = _build_multi_page_fixture_pdf_bytes(5)
-        original_extract_text = pdfplumber.page.Page.extract_text
+        original_extract_words = pdfplumber.page.Page.extract_words
         extracted_page_numbers = []
 
-        def spy_extract_text(self, *args, **kwargs):
+        def spy_extract_words(self, *args, **kwargs):
             extracted_page_numbers.append(self.page_number)
-            return original_extract_text(self, *args, **kwargs)
+            return original_extract_words(self, *args, **kwargs)
 
-        with patch.object(pdfplumber.page.Page, "extract_text", spy_extract_text):
+        with patch.object(pdfplumber.page.Page, "extract_words", spy_extract_words):
             result = extract_from_bytes(
                 pdf_bytes, ticker="2010", fiscal_year=2024, start_page=2, end_page=3,
             )
@@ -181,7 +346,7 @@ class TestPageRangeDiagnostic(unittest.TestCase):
         self.assertEqual(result["page_count"], 5, "page_count must still report the real document size")
         self.assertEqual(
             sorted(extracted_page_numbers), [2, 3],
-            "extract_text() must be called only for pages within the requested range",
+            "extract_words() must be called only for pages within the requested range",
         )
         self.assertEqual(
             {c["source_page"] for c in result["candidates"]}, {2, 3},

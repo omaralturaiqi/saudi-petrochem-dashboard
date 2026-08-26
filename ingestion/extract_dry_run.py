@@ -14,18 +14,60 @@ produces a list of candidate financial facts for human review. This module:
     a database even if it tried, because nothing in it imports the means
     to.
   - reuses parser.py's existing CONCEPTS / line_matches() /
-    looks_like_financial_value() / parse_number() / NUM_TOKEN_RE rather
-    than reimplementing the matching logic.
+    looks_like_financial_value() / parse_number() rather than
+    reimplementing the keyword-matching/number-parsing logic. parser.py is
+    NOT modified by this module.
+  - COORDINATE-AWARE (as of this revision): uses page.extract_words() (x0/
+    x1/top per word) instead of the flat page.extract_text() string. This
+    replaces the earlier flat-text approach, which was shown (via a
+    read-only diagnostic prototype run against the real SABIC FY2024 PDF)
+    to merge unrelated two-column content into a single "line" and to have
+    no way to bind a numeric value to a specific fiscal-year column. See
+    the helper functions below for the specific mechanisms:
+      * _detect_column_boundary() — finds the vertical whitespace gutter
+        that separates a left-column financial table from a right-column
+        narrative sidebar on a two-column annual-report page, so the two
+        are never merged into one reconstructed row.
+      * _group_words_into_rows() — y-position clustering, applied
+        SEPARATELY per column band (never across the detected boundary).
+      * year-header detection + nearest-column x-binding — locates a row
+        containing >=2 year-shaped tokens (e.g. "2024", "2023") and records
+        each token's x-position as a column; every numeric value found in
+        subsequent rows of that table block is bound to whichever year
+        column's x-center it is nearest to (within a tolerance), rather
+        than assuming the first or second number found is the requested
+        fiscal year.
+  - Only the left/primary column band (the financial-table region) is ever
+    scanned for concept matches. Right-column narrative/commentary text is
+    never scanned — this is what rejects a sentence that merely mentions a
+    concept and a number in prose from becoming a candidate.
+  - Table blocks are tracked (table_index, incremented at each detected
+    year-header row). A concept matched in more than one table_index on
+    the same page is NOT merged into one candidate — each stays a separate
+    candidate carrying its own table_index and column-binding results, and
+    is flagged with a warning that duplicate table blocks were found. This
+    is the honest, evidence-grounded version of "distinguish the SAR table
+    from a USD-denominated duplicate": this module has no reliable way to
+    read a literal currency label from the page, so it does not guess one
+    — it keeps duplicate-table candidates distinct and flags them for
+    human review rather than silently merging or silently trusting the
+    first one found.
   - never guesses which numeric column corresponds to the requested
-    fiscal year: when a line/window has more than one plausible numeric
-    value, BOTH are preserved (value_col1/value_col2) and an explicit
-    warning is attached instead of picking one.
+    fiscal year when coordinate binding cannot resolve it: value_col1/
+    value_col2 (first-two-numbers, preserved for backward compatibility)
+    still carry an explicit "not disambiguated" warning in that case. When
+    coordinate binding DOES resolve a fiscal-year column, the resolved
+    value is additionally exposed as requested_year_value/
+    mapped_year_values, and the "not disambiguated" warning is not added
+    (it no longer applies).
   - flags (never silently discards) any concept key not present in the
     documented, live concept_dictionary set (see KNOWN_CONCEPT_KEYS below).
   - surfaces (never silently deduplicates/overwrites) duplicate concept
     matches within one document — each occurrence is kept as its own
     candidate, with a warning attached to every candidate sharing that
-    concept key.
+    concept key (this is the existing, document-wide duplicate check —
+    unchanged; the new table_index duplicate check above is a separate,
+    page+table-scoped signal, not a replacement for it).
 
 This is a dry-run reporting tool only. It does NOT call
 register_source_document()/load_facts() (still unimplemented TODOs in
@@ -37,11 +79,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 from collections import Counter
 
 import pdfplumber
 
-from parser import CONCEPTS, NUM_TOKEN_RE, line_matches, looks_like_financial_value, parse_number
+from parser import CONCEPTS, line_matches, looks_like_financial_value, parse_number
 
 # The 19 concept_dictionary keys confirmed LIVE in Neon as of Phase 1
 # preparation (documented in schema.sql's "KNOWN LIVE-SCHEMA DRIFT"
@@ -65,6 +108,22 @@ KNOWN_CONCEPT_KEYS = frozenset({
 
 PDF_MAGIC_BYTES = b"%PDF-"
 
+# --- coordinate-aware extraction tuning constants -------------------------
+_YEAR_TOKEN_RE = re.compile(r"^(20\d{2}),?$")
+_ROW_Y_TOLERANCE = 3.0          # points; same clustering tolerance used by
+                                 # scripts/diagnose_pdf_word_coordinates.py,
+                                 # whose prototype this behavior is based on.
+_COLUMN_BOUNDARY_MIN_GUTTER = 30.0   # points; minimum whitespace corridor
+                                       # width to treat as a real two-column
+                                       # gutter rather than page margin noise.
+_COLUMN_BOUNDARY_MARGIN_FRACTION = 0.10  # ignore the outer 10% of page
+                                           # width on each side when hunting
+                                           # for a gutter (avoids treating a
+                                           # page edge as a column boundary).
+_YEAR_BIND_MAX_DISTANCE = 40.0  # points; a numeric token further than this
+                                  # from every known year column's x-center
+                                  # is left unmapped rather than force-bound.
+
 
 class PdfBytesInvalid(ValueError):
     """Raised when supplied bytes do not look like a real PDF. Pure
@@ -84,6 +143,93 @@ def verify_pdf_bytes(pdf_bytes: bytes) -> None:
         )
 
 
+def _is_year_token(text: str) -> bool:
+    return bool(_YEAR_TOKEN_RE.match(text.strip()))
+
+
+def _word_x_center(word: dict) -> float:
+    return (word["x0"] + word["x1"]) / 2.0
+
+
+def _group_words_into_rows(words: list[dict], y_tolerance: float = _ROW_Y_TOLERANCE) -> list[list[dict]]:
+    """Groups words into visual rows by clustering 'top' (y-position)
+    within y_tolerance points of each other. Pure geometry — no text/
+    keyword logic. Returns rows sorted top-to-bottom, each row's words
+    sorted left-to-right (by x0). Same approach used by the diagnostic
+    prototype (scripts/diagnose_pdf_word_coordinates.py) that this
+    revision is based on — deliberately called SEPARATELY per column band
+    by extract_from_bytes() below, never across a detected column
+    boundary, which is what prevents left-column/right-column merging."""
+    rows: list[list[dict]] = []
+    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        placed = False
+        for row in rows:
+            if abs(row[0]["top"] - w["top"]) <= y_tolerance:
+                row.append(w)
+                placed = True
+                break
+        if not placed:
+            rows.append([w])
+    for row in rows:
+        row.sort(key=lambda w: w["x0"])
+    rows.sort(key=lambda row: row[0]["top"])
+    return rows
+
+
+def _detect_column_boundary(words: list[dict], page_width: float) -> float | None:
+    """Finds the single widest vertical whitespace corridor ("gutter")
+    across the middle of the page (outer _COLUMN_BOUNDARY_MARGIN_FRACTION
+    on each side excluded, to avoid mistaking a page margin for a column
+    gutter). Returns the corridor's x-midpoint as the column boundary, or
+    None if no corridor at least _COLUMN_BOUNDARY_MIN_GUTTER points wide is
+    found (i.e. this page is treated as single-column).
+
+    Generic geometry only — not tuned to any specific document's known
+    column position. On a genuinely single-column page (e.g. this
+    module's own offline test fixtures, whose synthetic content occupies
+    only the left portion of the page), any "gutter" this finds simply
+    has no words on its far side — see extract_from_bytes(), where the
+    narrative-side word list ends up empty and every row still resolves
+    to the primary band exactly as before. It only has any actual effect
+    when there IS real content on both sides of a real gutter, i.e. a
+    genuine two-column layout."""
+    if not words or page_width <= 0:
+        return None
+    width_i = int(page_width) + 1
+    occupied = [False] * width_i
+    for w in words:
+        x0 = max(0, int(w["x0"]))
+        x1 = min(width_i, int(w["x1"]) + 1)
+        for x in range(x0, x1):
+            occupied[x] = True
+
+    margin = page_width * _COLUMN_BOUNDARY_MARGIN_FRACTION
+    lo, hi = int(margin), int(page_width - margin)
+    best_gap: tuple[int, int] | None = None
+    run_start: int | None = None
+    for x in range(lo, hi):
+        if not occupied[x]:
+            if run_start is None:
+                run_start = x
+        elif run_start is not None:
+            run_len = x - run_start
+            if run_len >= _COLUMN_BOUNDARY_MIN_GUTTER and (
+                best_gap is None or run_len > (best_gap[1] - best_gap[0])
+            ):
+                best_gap = (run_start, x)
+            run_start = None
+    if run_start is not None:
+        run_len = hi - run_start
+        if run_len >= _COLUMN_BOUNDARY_MIN_GUTTER and (
+            best_gap is None or run_len > (best_gap[1] - best_gap[0])
+        ):
+            best_gap = (run_start, hi)
+
+    if best_gap is None:
+        return None
+    return (best_gap[0] + best_gap[1]) / 2.0
+
+
 def extract_from_bytes(
     pdf_bytes: bytes,
     ticker: str,
@@ -91,17 +237,18 @@ def extract_from_bytes(
     start_page: int | None = None,
     end_page: int | None = None,
 ) -> dict:
-    """READ-ONLY, in-memory extraction. Never writes a file (uses
-    io.BytesIO, not a temp file), never imports any database code, never
-    persists pdf_bytes anywhere beyond this function's own local scope.
+    """READ-ONLY, in-memory, coordinate-aware extraction. Never writes a
+    file (uses io.BytesIO, not a temp file), never imports any database
+    code, never persists pdf_bytes anywhere beyond this function's own
+    local scope.
 
     start_page/end_page (both optional, 1-based, inclusive) restrict
     processing to a page range — a diagnostic aid for isolating which page
     of a large document is causing a failure. Defaults (None/None) process
     every page, matching the original, unrestricted behavior exactly.
-    Pages outside the requested range are never text-extracted at all (no
-    page.extract_text() call for them), so the full document's extracted
-    text is never held in memory regardless of range size.
+    Pages outside the requested range are never word-extracted at all (no
+    page.extract_words() call for them), so the full document's extracted
+    content is never held in memory regardless of range size.
 
     Raises ValueError if the requested range is invalid for this document
     (e.g. start_page > end_page, or end_page beyond the real page count).
@@ -114,8 +261,10 @@ def extract_from_bytes(
 
     Each candidate dict:
       ticker, fiscal_year, statement_type, concept, concept_known,
-      reported_label, value_col1, value_col2, currency, unit, source_page,
-      extraction_method, confidence, raw_text, warnings (list[str]).
+      reported_label, value_col1, value_col2, requested_year_value,
+      mapped_year_values, table_index, source_page, source_row_top,
+      source_word_positions, currency, unit, extraction_method,
+      confidence, raw_text, warnings (list[str]).
     """
     verify_pdf_bytes(pdf_bytes)
     document_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
@@ -144,57 +293,124 @@ def extract_from_bytes(
         for i, page in enumerate(pdf.pages):
             page_number = i + 1
             if page_number < range_start or page_number > range_end:
-                # Outside the requested range — skip entirely. extract_text()
-                # is never called for this page, so its text is never parsed
-                # or held in memory.
+                # Outside the requested range — skip entirely. extract_words()
+                # is never called for this page, so its content is never
+                # parsed or held in memory.
                 continue
             if page_number == range_start or page_number % 10 == 0 or page_number == range_end:
                 print(f"[extract_from_bytes] page {page_number}/{page_count}...", flush=True)
             try:
-                text = page.extract_text() or ""
-                if not text:
+                words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+                if not words:
                     continue
-                lines = text.split("\n")
-                # Same 2-line sliding window as parser.py's extract_company(),
-                # reused verbatim so a wrapped label still matches its numbers.
-                windows2 = [
-                    lines[j] + " " + lines[j + 1] if j + 1 < len(lines) else lines[j]
-                    for j in range(len(lines))
-                ]
 
-                for concept, keyword_groups, stmt_type, require_any, exclude_any in CONCEPTS:
-                    for line, window in zip(lines, windows2):
-                        line_lower = line.lower()
-                        window_lower = window.lower()
+                # Split the page into a primary (left/table) band and a
+                # narrative (right/sidebar) band using a detected column
+                # gutter. Rows are grouped SEPARATELY within each band, so
+                # a left-column table row and a right-column narrative
+                # sentence sharing a similar y-position can never be
+                # merged into one reconstructed row.
+                boundary = _detect_column_boundary(words, float(page.width))
+                if boundary is None:
+                    primary_words = words
+                else:
+                    primary_words = [w for w in words if w["x0"] < boundary]
+                    # Narrative-band words are deliberately never grouped
+                    # into rows or scanned for concepts — this is what
+                    # rejects a sidebar sentence that merely mentions a
+                    # concept/number in prose from becoming a candidate.
+
+                primary_rows = _group_words_into_rows(primary_words)
+
+                table_index = 0
+                # (year:int, x0:float, x1:float) for the CURRENT table
+                # block only — reset whenever a new year-header row is
+                # detected; a numeric value is bound to whichever entry's
+                # x-center it is nearest to, within _YEAR_BIND_MAX_DISTANCE.
+                year_columns: list[tuple[int, float, float]] = []
+                page_candidates: list[dict] = []
+
+                for row_idx, row in enumerate(primary_rows):
+                    row_year_tokens = [w for w in row if _is_year_token(w["text"])]
+                    if len(row_year_tokens) >= 2:
+                        # A year-header row — starts a new table block.
+                        # Never itself scanned as a data row.
+                        table_index += 1
+                        year_columns = [
+                            (int(w["text"].rstrip(",")), w["x0"], w["x1"])
+                            for w in row_year_tokens
+                        ]
+                        continue
+
+                    # Window = this row + the next row in the SAME band,
+                    # mirroring parser.py's original 2-physical-line
+                    # sliding window (so a label that wraps onto the next
+                    # line still matches its numbers) — but now built from
+                    # real word objects with coordinates, not flattened text.
+                    next_row = primary_rows[row_idx + 1] if row_idx + 1 < len(primary_rows) else []
+                    window_words = row + next_row
+                    line_text = " ".join(w["text"] for w in row)
+                    window_text = " ".join(w["text"] for w in window_words)
+                    line_lower = line_text.lower()
+                    window_lower = window_text.lower()
+
+                    for concept, keyword_groups, stmt_type, require_any, exclude_any in CONCEPTS:
                         if not line_matches(line_lower, keyword_groups):
                             continue
                         if require_any and not any(r in line_lower for r in require_any):
                             continue
                         if exclude_any and any(x in window_lower for x in exclude_any):
                             continue
-                        raw_tokens = NUM_TOKEN_RE.findall(window)
-                        good_tokens = [t for t in raw_tokens if looks_like_financial_value(t)]
-                        if not good_tokens:
+
+                        numeric_words = [w for w in window_words if looks_like_financial_value(w["text"])]
+                        if not numeric_words:
                             continue
-                        parsed_vals = [parse_number(t) for t in good_tokens]
-                        parsed_vals = [v for v in parsed_vals if v is not None]
-                        if not parsed_vals:
+                        parsed = [(w, parse_number(w["text"])) for w in numeric_words]
+                        parsed = [(w, v) for w, v in parsed if v is not None]
+                        if not parsed:
                             continue
 
+                        # Bind each numeric word to the nearest known year
+                        # column (if this table block has a detected
+                        # header) by x-center distance, instead of
+                        # assuming position in reading order == fiscal year.
+                        mapped_year_values: dict[int, float] = {}
+                        for w, v in parsed:
+                            if not year_columns:
+                                continue
+                            wc = _word_x_center(w)
+                            nearest_year, nx0, nx1 = min(
+                                year_columns, key=lambda yc: abs(((yc[1] + yc[2]) / 2.0) - wc)
+                            )
+                            if abs(((nx0 + nx1) / 2.0) - wc) <= _YEAR_BIND_MAX_DISTANCE:
+                                mapped_year_values.setdefault(nearest_year, v)
+
+                        requested_year_value = mapped_year_values.get(fiscal_year)
+
                         warnings: list[str] = []
-                        value_col1 = parsed_vals[0] if len(parsed_vals) > 0 else None
-                        value_col2 = parsed_vals[1] if len(parsed_vals) > 1 else None
-                        if value_col1 is not None and value_col2 is not None:
-                            # NEVER guess which column is the requested fiscal
-                            # year — both are preserved as-is, flagged instead.
+                        value_col1 = parsed[0][1] if len(parsed) > 0 else None
+                        value_col2 = parsed[1][1] if len(parsed) > 1 else None
+                        if requested_year_value is not None:
+                            # Coordinate binding resolved which column is
+                            # the requested fiscal year — no ambiguity.
+                            pass
+                        elif value_col1 is not None and value_col2 is not None:
+                            # NEVER guess which column is the requested
+                            # fiscal year when binding couldn't resolve it
+                            # — both are preserved as-is, flagged instead.
                             warnings.append(
                                 "multiple numeric columns; fiscal year column not disambiguated"
                             )
-                        if len(parsed_vals) > 2:
+                        if len(parsed) > 2:
                             warnings.append(
-                                f"{len(parsed_vals)} numeric tokens found on this line/window; "
+                                f"{len(parsed)} numeric tokens found on this row/window; "
                                 "only the first two are captured as value_col1/value_col2 — "
                                 "additional values are not represented"
+                            )
+                        if not year_columns:
+                            warnings.append(
+                                "no year-header row detected for this table block — "
+                                "requested_year_value could not be coordinate-mapped"
                             )
 
                         concept_known = concept in KNOWN_CONCEPT_KEYS
@@ -204,34 +420,64 @@ def extract_from_bytes(
                                 "concept_dictionary set — kept, not discarded"
                             )
 
-                        confidence = "MEDIUM" if len(parsed_vals) <= 3 else "LOW"
+                        confidence = "MEDIUM" if len(parsed) <= 3 else "LOW"
 
-                        candidates.append({
+                        page_candidates.append({
                             "ticker": ticker,
                             "fiscal_year": fiscal_year,
                             "statement_type": stmt_type,
                             "concept": concept,
                             "concept_known": concept_known,
-                            "reported_label": window.strip()[:90],
+                            "reported_label": window_text.strip()[:90],
                             "value_col1": value_col1,
                             "value_col2": value_col2,
+                            "requested_year_value": requested_year_value,
+                            "mapped_year_values": dict(mapped_year_values),
+                            "table_index": table_index,
                             "currency": "SAR",
                             "unit": "thousand",
                             "source_page": page_number,
-                            "extraction_method": "pdfplumber_text_keyword_v2_dry_run",
+                            "source_row_top": row[0]["top"] if row else None,
+                            "source_word_positions": [
+                                (w["text"], round(w["x0"], 1), round(w["x1"], 1)) for w, _ in parsed
+                            ],
+                            "extraction_method": "pdfplumber_coordinate_aware_v1_dry_run",
                             "confidence": confidence,
-                            "raw_text": window.strip()[:150],
+                            "raw_text": window_text.strip()[:150],
                             "warnings": warnings,
                         })
-                del text, lines, windows2
+
+                # Table-block duplicate detection: if the SAME concept was
+                # matched in more than one distinct table_index on this
+                # page (e.g. a SAR table and an apparent USD-denominated
+                # duplicate table, as observed in the real SABIC FY2024
+                # diagnostic), flag every affected candidate rather than
+                # silently merging them or trusting whichever was matched
+                # first. This module cannot reliably read a literal
+                # currency label off the page, so it does not guess one —
+                # duplicates are kept distinct and surfaced for review.
+                table_indexes_by_concept: dict[str, set[int]] = {}
+                for c in page_candidates:
+                    table_indexes_by_concept.setdefault(c["concept"], set()).add(c["table_index"])
+                for c in page_candidates:
+                    n_blocks = len(table_indexes_by_concept[c["concept"]])
+                    if n_blocks > 1:
+                        c["warnings"].append(
+                            f"concept {c['concept']!r} matched in {n_blocks} distinct table "
+                            f"blocks on page {page_number} (table_index={c['table_index']}) — "
+                            "possible duplicate/currency-converted table; not merged, review each"
+                        )
+
+                candidates.extend(page_candidates)
+                del words, primary_rows, page_candidates
             finally:
                 # Bound memory to ~1 page at a time. pdfplumber.PDF.pages
                 # (see pdfplumber/pdf.py) keeps every Page wrapper alive for
-                # the life of this `with` block, and page.extract_text()
-                # lazily populates that Page's cached parsed content (chars,
-                # rects, lines, curves, images, layout — see
-                # pdfplumber/container.py Container.cached_properties and
-                # Page.cached_properties) which is never cleared
+                # the life of this `with` block, and page.extract_words()/
+                # extract_text() lazily populate that Page's cached parsed
+                # content (chars, rects, lines, curves, images, layout —
+                # see pdfplumber/container.py Container.cached_properties
+                # and Page.cached_properties) which is never cleared
                 # automatically. Without this call, those caches accumulate
                 # across every page processed so far instead of being
                 # released once we're done with each page. page.close() is
@@ -243,6 +489,8 @@ def extract_from_bytes(
 
     # Duplicate detection: surfaced via a warning on every affected
     # candidate — never merged, never overwritten, every occurrence kept.
+    # Document-wide, unchanged from before this revision (separate from
+    # the page+table_index-scoped check above).
     concept_counts = Counter(c["concept"] for c in candidates)
     for c in candidates:
         n = concept_counts[c["concept"]]
