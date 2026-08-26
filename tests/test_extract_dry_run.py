@@ -229,6 +229,94 @@ class TestCoordinateAwareExtraction(unittest.TestCase):
             )
 
 
+def _build_stray_note_number_fixture_pdf_bytes() -> bytes:
+    """Builds a synthetic, real, single-page PDF with a REAL year-header
+    row and a data row whose two real values are correctly aligned under
+    "2024"/"2023" — plus a THIRD numeric token ("6.15") positioned far
+    from every header column (simulating a note/footnote-reference number
+    printed near a table row, e.g. "(Note 6.15)"), which must NOT bind to
+    any year column. Models the real SABIC evidence of note-reference-
+    shaped decimal numbers (e.g. "6.15", "35.2") appearing near genuine
+    table values."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(792, 612))
+    c.setFont("Helvetica", 10)
+    c.drawString(200, 560, "2024")
+    c.drawString(260, 560, "2023")
+    c.drawString(50, 540, "Total")
+    c.drawString(80, 540, "equity")
+    c.drawString(200, 540, "300.00")   # aligned under "2024"
+    c.drawString(260, 540, "280.00")   # aligned under "2023"
+    # Note-reference-shaped number: close enough to the table content that
+    # it does NOT open a new column gutter (_detect_column_boundary() picks
+    # only the single widest whitespace corridor, which remains the large
+    # trailing margin beyond x=340, not this ~60pt internal gap) — but far
+    # enough (>> _YEAR_BIND_MAX_DISTANCE=40pt) from both year columns'
+    # x-centers (~211 and ~271) that it must not bind to either.
+    c.drawString(340, 540, "6.15")
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+class TestP0ValueBindingFixes(unittest.TestCase):
+    """Proves the P0 fixes approved after the SABIC FY2024 false-positive
+    diagnosis: (1) no positional first-two-tokens fallback when the
+    requested fiscal year cannot be coordinate-mapped; (2) a numeric token
+    that fails to bind to any year column (e.g. a note-reference number)
+    is excluded from value_col1/value_col2/mapped_year_values even on an
+    otherwise-resolved row; (3) year_resolved is an explicit, reliable
+    signal of whether a candidate represents an actual resolved fiscal-
+    year value; (4) nothing is silently deleted — raw_numeric_tokens
+    preserves every token found, bound or not."""
+
+    def test_stray_unbound_token_excluded_but_preserved_on_resolved_row(self):
+        pdf_bytes = _build_stray_note_number_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        equity_candidates = [c for c in result["candidates"] if c["concept"] == "total_equity"]
+        self.assertEqual(len(equity_candidates), 1)
+        c = equity_candidates[0]
+
+        # The row DID resolve the requested year correctly, from the two
+        # real, correctly-aligned values.
+        self.assertTrue(c["year_resolved"])
+        self.assertEqual(c["requested_year_value"], 300.00)
+        self.assertEqual(c["mapped_year_values"], {2024: 300.00, 2023: 280.00})
+
+        # The stray "6.15" must never appear as a mapped year value, and
+        # must not have silently become value_col2 either (value_col1/
+        # value_col2 are the legacy first-two-tokens view — "6.15" is the
+        # THIRD token found, so it wouldn't land there positionally in
+        # this fixture regardless, but assert the real intended guard:
+        # it must be absent from mapped_year_values / requested figures).
+        self.assertNotIn(6.15, c["mapped_year_values"].values())
+        self.assertNotEqual(c["requested_year_value"], 6.15)
+
+        # Evidence preservation: "6.15" must still be present, verbatim,
+        # in raw_numeric_tokens, explicitly marked as NOT bound to any year.
+        stray_entries = [t for t in c["raw_numeric_tokens"] if t["value"] == 6.15]
+        self.assertEqual(len(stray_entries), 1, "the stray token must be preserved, not deleted")
+        self.assertIsNone(stray_entries[0]["bound_year"], "must be recorded as unbound, not guessed")
+
+        # And it must be surfaced in the warnings for human review.
+        self.assertTrue(
+            any("did not align with any detected year column" in w for w in c["warnings"])
+        )
+
+    def test_year_resolved_false_when_no_header_detected_at_all(self):
+        # Reuses the existing no-header fixture: confirms year_resolved is
+        # explicitly False (not just requested_year_value being None) when
+        # there is no year-header row to bind against at all.
+        pdf_bytes = _build_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        self.assertTrue(result["candidates"])
+        for c in result["candidates"]:
+            self.assertFalse(c["year_resolved"])
+            self.assertIsNone(c["value_col1"])
+            self.assertIsNone(c["value_col2"])
+            self.assertEqual(c["confidence"], "LOW")
+
+
 class TestPageMemoryRelease(unittest.TestCase):
     """Proves the memory fix: pdfplumber's per-page cache (chars/objects/
     layout — populated by extract_text()) is released via page.close()
@@ -514,18 +602,35 @@ class TestUnknownConceptFlagging(unittest.TestCase):
 
 
 class TestAmbiguityWarning(unittest.TestCase):
-    def test_multiple_numeric_columns_produce_ambiguity_warning(self):
-        # (F) a line with two plausible numeric columns must produce an
-        # explicit ambiguity warning, and BOTH values must be preserved
-        # (never guessed/dropped).
+    def test_unresolved_multiple_numeric_columns_leave_value_cols_unset_not_guessed(self):
+        # (F, P0-updated) _build_fixture_pdf_bytes() has NO year-header row
+        # at all, so the requested fiscal year can never be coordinate-
+        # mapped for this fixture. Per the P0 fix: when the year cannot be
+        # resolved, value_col1/value_col2 must be left unset (None) rather
+        # than falling back to "the first two numeric tokens found" as if
+        # they were real values — but NOTHING is discarded: every token
+        # actually found must still be present in raw_numeric_tokens.
         pdf_bytes = _build_fixture_pdf_bytes()
         result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
         revenue_candidates = [c for c in result["candidates"] if c["concept"] == "revenue"]
         self.assertTrue(revenue_candidates, "fixture must produce a revenue candidate")
         for c in revenue_candidates:
-            self.assertIsNotNone(c["value_col1"])
-            self.assertIsNotNone(c["value_col2"])
-            self.assertTrue(any("not disambiguated" in w for w in c["warnings"]))
+            self.assertFalse(c["year_resolved"])
+            self.assertIsNone(c["requested_year_value"])
+            self.assertIsNone(c["value_col1"], "must not fall back to a positional guess")
+            self.assertIsNone(c["value_col2"], "must not fall back to a positional guess")
+            self.assertEqual(c["confidence"], "LOW", "an unresolved year must never present as MEDIUM")
+            # Evidence preservation: every numeric token actually found in
+            # this candidate's window must still be present, verbatim, in
+            # raw_numeric_tokens. The window is this row + the next row
+            # (mirroring parser.py's original 2-line label-wrap design —
+            # see extract_from_bytes()), so the revenue row's window also
+            # includes the following "Net income..." row's two numbers.
+            raw_values = {t["value"] for t in c["raw_numeric_tokens"]}
+            self.assertEqual(raw_values, {1234567.0, 987654.0, -259180.0, 171061.0})
+            self.assertTrue(
+                any("could not be coordinate-mapped" in w for w in c["warnings"]),
+            )
 
 
 class TestDuplicateDetection(unittest.TestCase):

@@ -53,13 +53,25 @@ produces a list of candidate financial facts for human review. This module:
     human review rather than silently merging or silently trusting the
     first one found.
   - never guesses which numeric column corresponds to the requested
-    fiscal year when coordinate binding cannot resolve it: value_col1/
-    value_col2 (first-two-numbers, preserved for backward compatibility)
-    still carry an explicit "not disambiguated" warning in that case. When
-    coordinate binding DOES resolve a fiscal-year column, the resolved
-    value is additionally exposed as requested_year_value/
-    mapped_year_values, and the "not disambiguated" warning is not added
-    (it no longer applies).
+    fiscal year: value_col1/value_col2 are ONLY populated when
+    year_resolved is True (i.e. coordinate binding actually found the
+    requested fiscal_year among this table block's year columns). When it
+    could not be resolved — no year-header row detected for this table
+    block, or no token bound within tolerance to the requested year —
+    value_col1/value_col2 are explicitly left as None rather than falling
+    back to "the first two numeric tokens found", which previously let
+    unrelated numbers (note references, page numbers, stray ratios) be
+    silently reported as if they were real values. Nothing is discarded in
+    that case: every numeric token actually found in the matched window is
+    preserved in raw_numeric_tokens (text, x0/x1, parsed value, and which
+    year — if any — it bound to), so the evidence remains available for
+    human review even when no value_col1/value_col2 could be trusted. A
+    token that fails to bind to ANY year column (even on a row where other
+    tokens did bind) is likewise excluded from mapped_year_values/
+    requested_year_value, not merged in as noise. confidence is forced to
+    "LOW" whenever year_resolved is False, regardless of how many numbers
+    were on the row — "how many numbers were found" was never itself a
+    signal that the requested fiscal year had actually been identified.
   - flags (never silently discards) any concept key not present in the
     documented, live concept_dictionary set (see KNOWN_CONCEPT_KEYS below).
   - surfaces (never silently deduplicates/overwrites) duplicate concept
@@ -261,10 +273,16 @@ def extract_from_bytes(
 
     Each candidate dict:
       ticker, fiscal_year, statement_type, concept, concept_known,
-      reported_label, value_col1, value_col2, requested_year_value,
-      mapped_year_values, table_index, source_page, source_row_top,
-      source_word_positions, currency, unit, extraction_method,
-      confidence, raw_text, warnings (list[str]).
+      reported_label, value_col1, value_col2 (both None unless
+      year_resolved is True — see year_resolved below), requested_year_value,
+      year_resolved (bool — True iff requested_year_value is not None; a
+      candidate should not be treated as a valid fiscal_year extraction
+      unless this is True), mapped_year_values, raw_numeric_tokens (list of
+      {text, x0, x1, value, bound_year} for EVERY numeric token found in
+      the matched window, regardless of whether it ended up bound to a
+      year column — full evidence, never filtered out), table_index,
+      source_page, source_row_top, source_word_positions, currency, unit,
+      extraction_method, confidence, raw_text, warnings (list[str]).
     """
     verify_pdf_bytes(pdf_bytes)
     document_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
@@ -374,43 +392,94 @@ def extract_from_bytes(
                         # column (if this table block has a detected
                         # header) by x-center distance, instead of
                         # assuming position in reading order == fiscal year.
+                        # P0 fix: track EVERY token's bind outcome (not just
+                        # the requested year's), so a token that binds to NO
+                        # year column at all (e.g. a note/page-reference
+                        # number like "6.15" sitting next to real columns)
+                        # is identifiable and excluded from being treated as
+                        # a value, even on a row where OTHER tokens did
+                        # bind successfully.
                         mapped_year_values: dict[int, float] = {}
+                        raw_numeric_tokens: list[dict] = []
                         for w, v in parsed:
-                            if not year_columns:
-                                continue
-                            wc = _word_x_center(w)
-                            nearest_year, nx0, nx1 = min(
-                                year_columns, key=lambda yc: abs(((yc[1] + yc[2]) / 2.0) - wc)
-                            )
-                            if abs(((nx0 + nx1) / 2.0) - wc) <= _YEAR_BIND_MAX_DISTANCE:
-                                mapped_year_values.setdefault(nearest_year, v)
+                            bound_year = None
+                            if year_columns:
+                                wc = _word_x_center(w)
+                                nearest_year, nx0, nx1 = min(
+                                    year_columns, key=lambda yc: abs(((yc[1] + yc[2]) / 2.0) - wc)
+                                )
+                                if abs(((nx0 + nx1) / 2.0) - wc) <= _YEAR_BIND_MAX_DISTANCE:
+                                    bound_year = nearest_year
+                                    mapped_year_values.setdefault(nearest_year, v)
+                            # Full evidence preserved unconditionally — every
+                            # token found is reported here regardless of
+                            # whether it ended up bound to a year column,
+                            # per the explicit "do not silently delete
+                            # evidence" requirement.
+                            raw_numeric_tokens.append({
+                                "text": w["text"],
+                                "x0": round(w["x0"], 1),
+                                "x1": round(w["x1"], 1),
+                                "value": v,
+                                "bound_year": bound_year,
+                            })
 
                         requested_year_value = mapped_year_values.get(fiscal_year)
+                        year_resolved = requested_year_value is not None
 
                         warnings: list[str] = []
-                        value_col1 = parsed[0][1] if len(parsed) > 0 else None
-                        value_col2 = parsed[1][1] if len(parsed) > 1 else None
-                        if requested_year_value is not None:
-                            # Coordinate binding resolved which column is
-                            # the requested fiscal year — no ambiguity.
-                            pass
-                        elif value_col1 is not None and value_col2 is not None:
-                            # NEVER guess which column is the requested
-                            # fiscal year when binding couldn't resolve it
-                            # — both are preserved as-is, flagged instead.
+                        if year_resolved:
+                            # FY successfully coordinate-mapped: value_col1/
+                            # value_col2 are kept as legacy "first two
+                            # tokens found" info for backward compatibility
+                            # only — requested_year_value/mapped_year_values
+                            # are the authoritative fields a caller should
+                            # use for the actual fiscal-year figure.
+                            value_col1 = parsed[0][1] if len(parsed) > 0 else None
+                            value_col2 = parsed[1][1] if len(parsed) > 1 else None
+                        else:
+                            # P0 fix (requirements 1 & 3): do NOT fall back
+                            # to "first two numeric tokens found" as if they
+                            # were real values when the requested fiscal
+                            # year could not be reliably coordinate-mapped.
+                            # This is exactly the mechanism that let stray/
+                            # unrelated numbers (note references, page
+                            # numbers, unrelated ratios) be silently
+                            # reported as value_col1/value_col2. Nothing is
+                            # deleted — every raw token is preserved above
+                            # in raw_numeric_tokens for human review.
+                            value_col1 = None
+                            value_col2 = None
+                            if not year_columns:
+                                warnings.append(
+                                    f"no year-header row detected for this table block — "
+                                    f"fiscal year {fiscal_year} could not be coordinate-mapped; "
+                                    "value_col1/value_col2 intentionally left unset (not a "
+                                    "positional guess) — see raw_numeric_tokens for every "
+                                    "value actually found on this row/window"
+                                )
+                            else:
+                                warnings.append(
+                                    f"fiscal year {fiscal_year} was not among this table "
+                                    "block's detected year columns (or no token bound within "
+                                    "tolerance) — value_col1/value_col2 intentionally left "
+                                    "unset (not a positional guess) — see raw_numeric_tokens "
+                                    "for every value actually found on this row/window"
+                                )
+
+                        unbound_count = sum(1 for t in raw_numeric_tokens if t["bound_year"] is None)
+                        if year_columns and unbound_count:
                             warnings.append(
-                                "multiple numeric columns; fiscal year column not disambiguated"
+                                f"{unbound_count} of {len(raw_numeric_tokens)} numeric token(s) "
+                                "on this row/window did not align with any detected year "
+                                "column (e.g. a note/page-reference number) — excluded from "
+                                "value_col1/value_col2/mapped_year_values; see "
+                                "raw_numeric_tokens for the full set with bind status"
                             )
                         if len(parsed) > 2:
                             warnings.append(
-                                f"{len(parsed)} numeric tokens found on this row/window; "
-                                "only the first two are captured as value_col1/value_col2 — "
-                                "additional values are not represented"
-                            )
-                        if not year_columns:
-                            warnings.append(
-                                "no year-header row detected for this table block — "
-                                "requested_year_value could not be coordinate-mapped"
+                                f"{len(parsed)} numeric tokens found on this row/window — "
+                                "see raw_numeric_tokens for the complete set with bind status"
                             )
 
                         concept_known = concept in KNOWN_CONCEPT_KEYS
@@ -420,7 +489,17 @@ def extract_from_bytes(
                                 "concept_dictionary set — kept, not discarded"
                             )
 
-                        confidence = "MEDIUM" if len(parsed) <= 3 else "LOW"
+                        # P0 fix (requirement 3): a candidate whose
+                        # requested fiscal year was not actually resolved
+                        # must never present as equally trustworthy as one
+                        # that was — confidence is forced LOW rather than
+                        # being derived only from "how many numbers were on
+                        # this row", which said nothing about whether any
+                        # of them were confirmed to be the requested year.
+                        if year_resolved:
+                            confidence = "MEDIUM" if len(parsed) <= 3 else "LOW"
+                        else:
+                            confidence = "LOW"
 
                         page_candidates.append({
                             "ticker": ticker,
@@ -432,7 +511,9 @@ def extract_from_bytes(
                             "value_col1": value_col1,
                             "value_col2": value_col2,
                             "requested_year_value": requested_year_value,
+                            "year_resolved": year_resolved,
                             "mapped_year_values": dict(mapped_year_values),
+                            "raw_numeric_tokens": raw_numeric_tokens,
                             "table_index": table_index,
                             "currency": "SAR",
                             "unit": "thousand",
@@ -441,7 +522,7 @@ def extract_from_bytes(
                             "source_word_positions": [
                                 (w["text"], round(w["x0"], 1), round(w["x1"], 1)) for w, _ in parsed
                             ],
-                            "extraction_method": "pdfplumber_coordinate_aware_v1_dry_run",
+                            "extraction_method": "pdfplumber_coordinate_aware_v2_dry_run",
                             "confidence": confidence,
                             "raw_text": window_text.strip()[:150],
                             "warnings": warnings,
