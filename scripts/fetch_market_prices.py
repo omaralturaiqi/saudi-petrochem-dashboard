@@ -24,23 +24,53 @@ DATA SOURCE — read this before trusting the output:
   (literal, hardcoded) in the `source` column specifically so this can
   never be silently confused with a higher-tier source later.
 
+GRANULARITY FIX (this revision): the first live run of this script
+(commit a61d863, executed via Render Shell) requested a single
+range=max&interval=1d call per ticker and got back only ~198 rows spanning
+~16 years (2010-03-31 .. 2026-09-01) — approximately 12 rows/year, i.e.
+MONTHLY granularity, not the ~250 rows/year daily granularity requested.
+This is a known Yahoo Finance behavior: when range=max (or any period1/
+period2 span of several years) is combined with interval=1d, Yahoo silently
+downgrades to a coarser granularity instead of honoring interval=1d, with
+no error or warning in the response itself. The fix: request one
+YEAR at a time (explicit period1/period2 per calendar year, still
+interval=1d each), which stays well inside the span Yahoo will actually
+honor at daily granularity, and check the row count returned for each
+year against what a real trading year should contain.
+
 WHAT THIS SCRIPT DOES:
   1. Reads (ticker, company_id) for every row in core.companies via Neon's
      SQL-over-HTTP endpoint (same read pattern as app.py/us_xbrl_api.py) —
      read-only SELECT only, no write capability is exercised against Neon
      anywhere in this script.
-  2. For each company, requests Yahoo Finance's chart endpoint with
-     range=max&interval=1d — this lets Yahoo itself determine the earliest
-     available trading day for that ticker, rather than this script
-     assuming/guessing a start date.
+  2. For each company, requests Yahoo Finance's chart endpoint ONE
+     CALENDAR YEAR AT A TIME (period1=Jan 1 of that year, period2=Jan 1 of
+     the next year, interval=1d), from YEAR_RANGE_START through the
+     current year — never a single multi-year range=max call (see
+     "GRANULARITY FIX" above). A short delay is added between requests to
+     avoid Yahoo rate-limiting, since each company now needs one request
+     per year instead of one request total.
   3. Extracts trade_date (from each Unix timestamp), open, high, low,
-     close, adjclose, and volume for each trading day in the response.
+     close, adjclose, and volume for each trading day in each year's
+     response.
   4. Skips (does not fabricate) any day where Yahoo's own response has a
      null close price for that index — this happens for non-trading days
      included in the timestamp array, or genuine data gaps in Yahoo's own
      dataset. A skipped day is not a row in the output; nothing is
      invented to fill it.
-  5. Writes batched `INSERT INTO core.market_prices (...) VALUES (...)
+  5. After extracting each year's rows, compares the count actually
+     received against a dynamic expected minimum (proportional to how many
+     calendar days actually fall in that year's window, capped at "today"
+     for the current year) — a year with ZERO rows is logged as
+     informational (genuinely no trading that year, e.g. before listing,
+     is an entirely normal and expected case), but a NONZERO count well
+     below the expected minimum is logged as an explicit WARNING (the
+     monthly-granularity failure signature this fix targets) rather than
+     being silently accepted as valid. The rows are still included in the
+     output either way — this script does not know FOR CERTAIN that a
+     low count is wrong, only that it looks suspicious — but the warning
+     ensures it is never silently trusted.
+  6. Writes batched `INSERT INTO core.market_prices (...) VALUES (...)
      ON CONFLICT (company_id, trade_date, source) DO NOTHING;` statements
      — matching core.market_prices' actual UNIQUE(company_id, trade_date,
      source) constraint exactly — to market_prices_insert_statements.sql.
@@ -66,12 +96,27 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from datetime import date, datetime, timezone
 
 YAHOO_CHART_URL_TEMPLATE = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}.SR"
 OUTPUT_SQL_PATH = "market_prices_insert_statements.sql"
 SOURCE_LITERAL = "yahoo_finance"
 INSERT_BATCH_SIZE = 250
+
+# --- yearly-window fetch tuning ---------------------------------------------
+YEAR_RANGE_START = 2010  # per explicit instruction; harmless for a company
+                          # not yet listed that early — Yahoo just returns 0
+                          # rows for those years, logged as informational,
+                          # not an error.
+INTER_REQUEST_DELAY_SECONDS = 0.4  # each company now issues one HTTP request
+                                     # per year instead of one total — this
+                                     # delay is to avoid Yahoo rate-limiting.
+# A full trading year is ~250-260 sessions (holidays/weekends excluded).
+# Used as a per-calendar-day rate to build a dynamic expected-minimum for
+# partial windows (e.g. the current, still-in-progress year) without
+# hardcoding a single full-year number that would false-positive on those.
+EXPECTED_TRADING_DAYS_FRACTION_OF_CALENDAR_DAYS = 0.5
 
 
 def get_neon_sql_url() -> str:
@@ -110,16 +155,44 @@ def fetch_companies_from_db() -> list[dict]:
     return resp.json()["rows"]
 
 
-def fetch_yahoo_chart(ticker: str) -> dict:
-    """GET Yahoo Finance's chart endpoint for {ticker}.SR, range=max so
-    Yahoo itself determines the earliest available day — never assumed
-    or hardcoded by this script."""
+def year_windows(start_year: int, end_year: int) -> list[tuple[int, int, int]]:
+    """Pure, offline-testable: builds one (year, period1, period2) Unix-
+    timestamp window per calendar year from start_year through end_year
+    inclusive. period1 = Jan 1 00:00:00 UTC of that year; period2 = Jan 1
+    00:00:00 UTC of the NEXT year (exclusive upper bound, covers all of
+    `year` with no overlap and no gap between consecutive windows)."""
+    windows: list[tuple[int, int, int]] = []
+    for year in range(start_year, end_year + 1):
+        period1 = int(datetime(year, 1, 1, tzinfo=timezone.utc).timestamp())
+        period2 = int(datetime(year + 1, 1, 1, tzinfo=timezone.utc).timestamp())
+        windows.append((year, period1, period2))
+    return windows
+
+
+def expected_min_rows(period1: int, period2: int) -> int:
+    """Dynamic expected-minimum row count for a window, proportional to how
+    many calendar days actually fall in it (capped at 'now' for a window
+    that extends into the future, e.g. the current, in-progress year) —
+    avoids false-positive warnings on a legitimately partial year."""
+    now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+    effective_period2 = min(period2, now_ts)
+    calendar_days = max(0, (effective_period2 - period1) // 86400)
+    return int(calendar_days * EXPECTED_TRADING_DAYS_FRACTION_OF_CALENDAR_DAYS)
+
+
+def fetch_yahoo_chart_year(ticker: str, period1: int, period2: int) -> dict:
+    """GET Yahoo Finance's chart endpoint for {ticker}.SR for ONE explicit
+    calendar-year window (period1/period2 as Unix timestamps), interval=1d.
+    See module docstring's "GRANULARITY FIX" — a single multi-year
+    range=max call was found (via a real Render Shell run) to make Yahoo
+    silently downgrade to monthly granularity; a one-year-at-a-time window
+    stays inside the span Yahoo actually honors interval=1d for."""
     import requests
 
     url = YAHOO_CHART_URL_TEMPLATE.format(ticker=ticker)
     resp = requests.get(
         url,
-        params={"range": "max", "interval": "1d"},
+        params={"period1": period1, "period2": period2, "interval": "1d"},
         headers={"User-Agent": "Mozilla/5.0"},  # Yahoo's endpoint rejects requests with no User-Agent
         timeout=30,
     )
@@ -239,6 +312,11 @@ def main() -> None:
         print(f"  ticker={c['ticker']!r} company_id={c['company_id']}")
     print()
 
+    current_year = datetime.now(tz=timezone.utc).year
+    windows = year_windows(YEAR_RANGE_START, current_year)
+    print(f"Year windows: {YEAR_RANGE_START}-{current_year} ({len(windows)} requests per company)")
+    print()
+
     all_statements: list[str] = []
     failed: list[tuple[str, str]] = []
 
@@ -246,32 +324,58 @@ def main() -> None:
         ticker = c["ticker"]
         company_id = c["company_id"]
         print(f"--- {ticker} ---")
-        try:
-            chart_json = fetch_yahoo_chart(ticker)
-            rows = extract_price_rows(chart_json)
-        except Exception as e:
-            msg = f"{type(e).__name__}: {e}"
-            print(f"  FETCH FAILED: {msg}")
-            failed.append((ticker, msg))
+        company_rows: list[dict] = []
+
+        for i, (year, period1, period2) in enumerate(windows):
+            if i > 0:
+                time.sleep(INTER_REQUEST_DELAY_SECONDS)
+            try:
+                chart_json = fetch_yahoo_chart_year(ticker, period1, period2)
+                year_rows = extract_price_rows(chart_json)
+            except Exception as e:
+                # A single bad year does not abort the whole company — log
+                # and continue to the next year, same "don't fabricate,
+                # don't silently drop the rest" principle as before.
+                print(f"  {year}: FETCH FAILED: {type(e).__name__}: {e}")
+                continue
+
+            if not year_rows:
+                print(f"  {year}: 0 rows (no trading data this year — e.g. before listing; not an error)")
+                continue
+
+            min_expected = expected_min_rows(period1, period2)
+            if len(year_rows) < min_expected:
+                print(
+                    f"  {year}: WARNING — {len(year_rows)} rows, expected at least "
+                    f"~{min_expected} for this window's calendar-day span. This is the "
+                    "monthly-granularity failure signature this fix targets, OR a "
+                    "genuine partial-listing/trading-halt year — not assumed to be "
+                    "either; rows are still included below, not discarded, but this "
+                    "must be reviewed before treating them as reliable daily data."
+                )
+            else:
+                print(f"  {year}: {len(year_rows)} rows (OK, >= expected minimum ~{min_expected})")
+
+            company_rows.extend(year_rows)
+
+        if not company_rows:
+            print("  0 total rows extracted across all years — skipping, not fabricating any row")
+            failed.append((ticker, "0 rows across all year windows"))
+            print()
             continue
 
-        if not rows:
-            print("  0 rows extracted (no usable trading days in response) — skipping, not fabricating any row")
-            failed.append((ticker, "0 rows in response"))
-            continue
-
-        rows.sort(key=lambda r: r["trade_date"])
-        print(f"  rows extracted: {len(rows)}")
-        print(f"  date range: {rows[0]['trade_date']} .. {rows[-1]['trade_date']}")
+        company_rows.sort(key=lambda r: r["trade_date"])
+        print(f"  TOTAL rows extracted: {len(company_rows)}")
+        print(f"  date range: {company_rows[0]['trade_date']} .. {company_rows[-1]['trade_date']}")
         print("  first 3 rows:")
-        for r in rows[:3]:
+        for r in company_rows[:3]:
             print(f"    {r['trade_date']}  close={r['close']}")
         print("  last 3 rows:")
-        for r in rows[-3:]:
+        for r in company_rows[-3:]:
             print(f"    {r['trade_date']}  close={r['close']}")
 
-        statements = build_insert_sql(rows, company_id)
-        all_statements.extend([f"-- {ticker}.SR — {len(rows)} rows"] + statements)
+        statements = build_insert_sql(company_rows, company_id)
+        all_statements.extend([f"-- {ticker}.SR — {len(company_rows)} rows"] + statements)
         print()
 
     with open(OUTPUT_SQL_PATH, "w", encoding="utf-8") as f:
