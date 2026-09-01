@@ -5,7 +5,8 @@ scripts/discover_tadawul_companies.py
 Discovery-only, metadata-only: builds one SQL file of core.companies
 INSERT statements for the Tadawul (TASI) main-market companies not
 already in core.companies. No PDFs, no financial data, no archive of
-any kind — ticker, name_en, sector only, per this task's own scope.
+any kind — ticker, name_en, name_ar, sector only, per this task's own
+scope.
 
 DATA SOURCE — read this before trusting the output:
   This script does NOT fetch anything live. It was attempted this
@@ -15,19 +16,28 @@ DATA SOURCE — read this before trusting the output:
   test (example.com also blocked), so the live page/API structure of
   either source could not be independently inspected here.
 
-  Instead, the company list below (RAW_COMPANIES) is a hardcoded
-  transcription of a list the project owner states they fetched live
-  from argaam.com/en themselves (outside this sandbox) on 2026-09-01,
-  then pasted into this session as raw text. This script did NOT fetch
-  it and did NOT independently verify it against a live source — it
-  only transcribed the pasted list into Python data and checked its
-  internal consistency (no duplicate tickers, no missing fields). If
-  Argaam's actual list has since changed (new listing, delisting,
-  rename), this file will be stale until it is regenerated from a
-  fresh paste or a real, verified live-fetch path is built.
+  Instead, the company list below (RAW_COMPANIES) and the Arabic-name
+  lookup (ARABIC_NAMES_BY_TICKER) are hardcoded transcriptions of two
+  lists the project owner states they fetched live themselves (outside
+  this sandbox) — English from argaam.com/en on 2026-09-01, Arabic from
+  argaam.com/ar/company/companylist shortly after — then pasted into
+  this session as raw text. This script did NOT fetch either list and
+  did NOT independently verify either against a live source — it only
+  transcribed both pastes into Python data, matched the Arabic names to
+  the English list explicitly by ticker (never by line/list position),
+  and checked internal consistency (no duplicate tickers in
+  RAW_COMPANIES; every kept row has both name_en and name_ar present).
+  If Argaam's actual list has since changed (new listing, delisting,
+  rename), this file will be stale until it is regenerated from a fresh
+  paste or a real, verified live-fetch path is built.
 
-  name_ar is not available in the source list (it was English-only) —
-  every row leaves name_ar as NULL rather than inventing a translation.
+  A RAW_COMPANIES ticker with no entry in ARABIC_NAMES_BY_TICKER is a
+  real gap, not an error to paper over: core.financial's company_id
+  aside, core.companies.name_ar is NOT NULL, and the live Neon run this
+  task exists to fix confirmed every one of the first 250-company batch
+  failed on exactly that constraint — so such a ticker is logged as a
+  WARNING and excluded from the generated SQL entirely, never given an
+  empty string or a fabricated/placeholder name_ar.
 
 WHAT THIS SCRIPT DOES:
   1. Filters RAW_COMPANIES to exclude:
@@ -39,10 +49,14 @@ WHAT THIS SCRIPT DOES:
          exists so a future paste can mark one without deleting it
          silently; those are logged as WARNING and excluded, never
          invented a sector/name for.
+       - any ticker with no matching entry in ARABIC_NAMES_BY_TICKER —
+         logged as a separate WARNING (skipped_no_arabic_name), excluded
+         from the generated SQL, never given a placeholder name_ar.
   2. Verifies no duplicate ticker exists within RAW_COMPANIES itself
      (a transcription error, not a filtering decision) — raises loudly
      if one is found rather than silently deduping.
-  3. Builds one INSERT per company, each guarded by
+  3. Builds one INSERT per company (with both name_en and name_ar),
+     each guarded by
      WHERE NOT EXISTS (SELECT 1 FROM core.companies WHERE ticker = ...)
      — NOT "ON CONFLICT (ticker) DO NOTHING", because core.companies has
      NO real UNIQUE/exclusion constraint on ticker (verified this
@@ -376,6 +390,127 @@ RAW_COMPANIES: list[tuple[str, str, str]] = [
     ("4165", "ALMAJED OUD", "Household & Personal Products"),
 ]
 
+# Arabic company names, keyed explicitly by ticker (never by list
+# position/order) — a second list the project owner states they fetched
+# live from argaam.com/ar/company/companylist themselves and pasted into
+# this session as raw text, matched ticker-by-ticker against
+# RAW_COMPANIES. Like RAW_COMPANIES' English names, this script did NOT
+# fetch or independently verify this list (WebFetch confirmed fully
+# blocked in the authoring sandbox this session) — it only transcribed it
+# into a dict and cross-checked it against RAW_COMPANIES' tickers (see
+# filter_companies(): any RAW_COMPANIES ticker missing here is WARNED
+# and excluded from the generated SQL, never given an empty/placeholder
+# name_ar).
+ARABIC_NAMES_BY_TICKER: dict[str, str] = {
+    # Energy
+    "2222": "أرامكو السعودية", "2030": "المصافي", "2380": "بترو رابغ",
+    "4030": "البحري", "2381": "الحفر العربية", "2382": "أديس",
+    # Materials
+    "1201": "تكوين", "1202": "مبكو", "1210": "بي سي آي", "1211": "معادن",
+    "1301": "أسلاك", "1304": "اليمامة للحديد", "1320": "أنابيب السعودية",
+    "2001": "كيمانول", "2010": "سابك", "2020": "سابك للمغذيات الزراعية",
+    "2090": "جبسكو", "2150": "زجاج", "2170": "اللجين", "2180": "فيبكو",
+    "2200": "أنابيب", "2210": "نماء للكيماويات", "2220": "معدنية",
+    "2240": "صناعات", "2250": "المجموعة السعودية", "2290": "ينساب",
+    "2300": "صناعة الورق", "2310": "سبكيم العالمية", "2330": "المتقدمة",
+    "2350": "كيان السعودية", "3002": "أسمنت نجران", "3003": "أسمنت المدينة",
+    "3004": "أسمنت الشمالية", "3005": "أسمنت ام القرى", "3010": "أسمنت العربية",
+    "3020": "أسمنت اليمامة", "3030": "أسمنت السعودية", "3040": "أسمنت القصيم",
+    "3050": "أسمنت الجنوب", "3060": "أسمنت ينبع", "3080": "أسمنت الشرقية",
+    "3090": "أسمنت تبوك", "3091": "أسمنت الجوف", "3092": "أسمنت الرياض",
+    "2060": "التصنيع", "3008": "الكثيري", "3007": "الواحة",
+    "1321": "أنابيب الشرق", "1322": "أماك", "2223": "لوبريف",
+    "1324": "صالح الراشد", "2360": "الفخارية", "1323": "يو سي آي سي",
+    "4143": "تالكو",
+    # Capital Goods
+    "1212": "أسترا الصناعية", "4146": "جاز", "1302": "بوان",
+    "1303": "الصناعات الكهربائية", "4148": "الوسائل الصناعية", "4145": "أو جي سي",
+    "2040": "الخزف السعودي", "2110": "الكابلات السعودية", "4144": "رؤوم",
+    "2160": "أميانتيت", "2320": "البابطين", "2370": "مسك", "4140": "صادرات",
+    "4141": "العمران", "4142": "كابلات الرياض", "1214": "شاكر",
+    "4110": "باتك", "4147": "سي جي إس",
+    # Commercial & Professional Svc
+    "4270": "طباعة وتغليف", "6004": "كاتريون", "1832": "صدر",
+    "1831": "مهارة", "1833": "الموارد", "1834": "سماسكو", "1835": "تمكين",
+    # Transportation
+    "4031": "الخدمات الأرضية", "4040": "سابتكو", "4260": "بدجت السعودية",
+    "2190": "سيسكو القابضة", "4261": "ذيب", "4263": "سال", "4262": "لومي",
+    "4265": "شري", "4264": "طيران ناس",
+    # Consumer Durables & Apparel
+    "1213": "نسيج", "2130": "صدق", "2340": "ارتيكس", "4011": "لازوردي",
+    "4180": "مجموعة فتيحي", "4012": "الأصيل",
+    # Consumer Services
+    "1810": "سيرا", "6013": "التطويرية الغذائية", "1820": "بان",
+    "4170": "شمس", "4290": "الخليج للتدريب", "6017": "جاهز",
+    "6002": "هرفي للأغذية", "1830": "لجام للرياضة", "6012": "ريدان",
+    "4291": "الوطنية للتعليم", "4292": "عطاء", "6014": "الآمار",
+    "6015": "أمريكانا", "6016": "برغرايززر", "6018": "الأندية للرياضة",
+    "6019": "المسار الشامل", "6022": "أرماح",
+    # Media and Entertainment
+    "4070": "تهامة", "4210": "الأبحاث والإعلام", "4071": "العربية",
+    "4072": "مجموعة إم بي سي",
+    # Consumer Discretionary Distribution & Retail
+    "4003": "إكسترا", "4008": "ساكو", "4050": "ساسكو", "4190": "جرير",
+    "4240": "سينومي ريتيل", "4191": "أبو معطي", "4051": "باعظيم",
+    "4192": "السيف غاليري", "4193": "نايس ون", "4194": "محطة البناء",
+    "4200": "الدريس",
+    # Consumer Staples Distribution & Retail
+    "4001": "أسواق ع العثيم", "4006": "أسواق المزرعة", "4061": "أنعام القابضة",
+    "4160": "ثمار", "4161": "بن داود", "4162": "المنجم", "4164": "النهدي",
+    "4163": "الدواء",
+    # Food & Beverages
+    "2050": "مجموعة صافولا", "2100": "وفرة", "2270": "سدافكو",
+    "2280": "المراعي", "6001": "حلواني إخوان", "2288": "نفوذ",
+    "6010": "نادك", "6020": "جاكو", "6040": "تبوك الزراعية",
+    "6050": "الأسماك", "6060": "الشرقية للتنمية", "6070": "الجوف",
+    "6090": "جازادكو", "2281": "تنمية", "2282": "نقي",
+    "2283": "المطاحن الأولى", "4080": "سناد القابضة", "2284": "المطاحن الحديثة",
+    "2285": "المطاحن العربية", "2286": "المطاحن الرابعة", "2287": "إنتاج",
+    # Health Care Equipment & Svc
+    "4002": "المواساة", "4021": "المركز الكندي الطبي", "4004": "دله الصحية",
+    "4005": "رعاية", "4007": "الحمادي", "4009": "السعودي الألماني الصحية",
+    "2230": "الكيميائية", "4013": "سليمان الحبيب", "2140": "أيان",
+    "4014": "دار المعدات", "4017": "فقيه الطبية", "4018": "الموسى",
+    "4019": "اس ام سي للرعاية الصحية",
+    # Pharma, Biotech & Life Sciences
+    "2070": "الدوائية", "4015": "جمجوم فارما", "4016": "أفالون فارما",
+    # Banks
+    "1010": "الرياض", "1020": "الجزيرة", "1030": "الإستثمار", "1050": "بي اس اف",
+    "1060": "الأول", "1080": "العربي", "1120": "الراجحي", "1140": "البلاد",
+    "1150": "الإنماء", "1180": "الأهلي",
+    # Financial Services
+    "2120": "متطورة", "4280": "المملكة", "4130": "درب السعودية",
+    "4081": "النايفات", "1111": "مجموعة تداول", "4082": "مرنة",
+    "1182": "أملاك", "1183": "سهل", "4083": "تسهيل", "4084": "دراية",
+    # Insurance
+    "8010": "التعاونية", "8012": "جزيرة تكافل", "8020": "ملاذ للتأمين",
+    "8030": "ميدغلف للتأمين", "8040": "متكاملة", "8050": "سلامة",
+    "8060": "ولاء", "8070": "الدرع العربي", "8190": "المتحدة للتأمين",
+    "8230": "تكافل الراجحي", "8280": "ليفا", "8150": "أسيج",
+    "8210": "بوبا العربية", "8180": "الصقر للتأمين", "8170": "الاتحاد",
+    "8100": "سايكو", "8120": "إتحاد الخليج الأهلية", "8200": "الإعادة السعودية",
+    "8160": "التأمين العربية", "8250": "جي آي جي", "8240": "تْشب",
+    "8260": "الخليجية العامة", "8300": "الوطنية", "8310": "أمانة للتأمين",
+    "8311": "عناية", "8313": "رسن",
+    # Telecommunication Services
+    "7010": "اس تي سي", "7020": "إتحاد إتصالات", "7030": "زين السعودية",
+    "7040": "قو للإتصالات",
+    # Utilities
+    "2080": "الغاز القابضة", "5110": "السعودية للطاقة", "2081": "الخريف",
+    "2082": "أكوا", "2083": "مرافق", "2084": "مياهنا",
+    # Real Estate Mgmt & Dev't
+    "4020": "العقارية", "4324": "بنان", "4328": "لدن", "4323": "سمو",
+    "4090": "طيبة", "4100": "مكة", "4150": "التعمير", "4220": "إعمار",
+    "4230": "البحر الأحمر", "4250": "جبل عمر", "4300": "دار الأركان",
+    "4310": "مدينة المعرفة", "4320": "الأندلس", "4321": "سينومي سنترز",
+    "4322": "رتال", "4326": "الماجدية", "4325": "مسار", "4327": "الرمز",
+    # Software & Services
+    "7201": "بحر العرب", "7211": "عزم", "7200": "ام آي اس",
+    "7202": "سلوشنز", "7203": "علم", "7204": "توبي", "7205": "دي بي اس",
+    # Household & Personal Products
+    "4165": "الماجد للعود",
+}
+
 # Snapshot of tickers already live in core.companies as of this script's
 # writing (2026-09-01) — see the module docstring's STALE RISK note for
 # why this is a snapshot, not a live lookup, and why the generated SQL's
@@ -416,34 +551,48 @@ def filter_companies(
     companies: list[tuple[str, str, str]],
     existing_tickers: set[str],
     ambiguous_tickers: set[str],
-) -> tuple[list[tuple[str, str, str]], list[str], list[str]]:
-    """Pure, offline-testable. Returns (kept, skipped_existing, skipped_ambiguous)."""
-    kept: list[tuple[str, str, str]] = []
+    arabic_names_by_ticker: dict[str, str],
+) -> tuple[list[tuple[str, str, str, str]], list[str], list[str], list[str]]:
+    """Pure, offline-testable. Returns (kept, skipped_existing,
+    skipped_ambiguous, skipped_no_arabic_name). kept rows are
+    (ticker, name_en, name_ar, sector) — name_ar resolved explicitly by
+    ticker lookup into arabic_names_by_ticker, never by list position. A
+    ticker with no Arabic-name match is excluded and reported separately
+    from skipped_existing/skipped_ambiguous, never given an empty/
+    placeholder name_ar."""
+    kept: list[tuple[str, str, str, str]] = []
     skipped_existing: list[str] = []
     skipped_ambiguous: list[str] = []
-    for ticker, name, sector in companies:
+    skipped_no_arabic_name: list[str] = []
+    for ticker, name_en, sector in companies:
         if ticker in existing_tickers:
             skipped_existing.append(ticker)
             continue
         if ticker in ambiguous_tickers:
             skipped_ambiguous.append(ticker)
             continue
-        kept.append((ticker, name, sector))
-    return kept, skipped_existing, skipped_ambiguous
+        name_ar = arabic_names_by_ticker.get(ticker)
+        if not name_ar:
+            skipped_no_arabic_name.append(ticker)
+            continue
+        kept.append((ticker, name_en, name_ar, sector))
+    return kept, skipped_existing, skipped_ambiguous, skipped_no_arabic_name
 
 
-def build_insert_sql(companies: list[tuple[str, str, str]]) -> list[str]:
+def build_insert_sql(companies: list[tuple[str, str, str, str]]) -> list[str]:
     """One INSERT per company, guarded by WHERE NOT EXISTS against
     core.companies.ticker (see module docstring for why NOT ON CONFLICT:
     core.companies has no real UNIQUE/exclusion constraint on ticker).
-    name_ar is explicitly NULL — not available from this source, never
-    invented."""
+    companies rows are (ticker, name_en, name_ar, sector) — both names
+    are required non-NULL by the time a row reaches this function;
+    filter_companies() is what excludes a ticker missing name_ar, this
+    function does not re-check that."""
     statements: list[str] = []
-    for ticker, name_en, sector in companies:
+    for ticker, name_en, name_ar, sector in companies:
         stmt = (
             "INSERT INTO core.companies (company_id, ticker, name_ar, name_en, sector, status, created_at, updated_at)\n"
             "SELECT gen_random_uuid(), "
-            f"{_sql_literal(ticker)}, NULL, {_sql_literal(name_en)}, {_sql_literal(sector)}, 'active', now(), now()\n"
+            f"{_sql_literal(ticker)}, {_sql_literal(name_ar)}, {_sql_literal(name_en)}, {_sql_literal(sector)}, 'active', now(), now()\n"
             "WHERE NOT EXISTS (\n"
             f"    SELECT 1 FROM core.companies WHERE ticker = {_sql_literal(ticker)}\n"
             ");"
@@ -464,15 +613,17 @@ def main() -> None:
         print(f"REFUSED: {e}", file=__import__("sys").stderr)
         raise SystemExit(1)
 
-    kept, skipped_existing, skipped_ambiguous = filter_companies(
-        RAW_COMPANIES, EXISTING_TICKERS, AMBIGUOUS_TICKERS
+    kept, skipped_existing, skipped_ambiguous, skipped_no_arabic_name = filter_companies(
+        RAW_COMPANIES, EXISTING_TICKERS, AMBIGUOUS_TICKERS, ARABIC_NAMES_BY_TICKER
     )
 
     print(f"RAW_COMPANIES total (as transcribed): {len(RAW_COMPANIES)}")
     print(f"Skipped (already in core.companies, per EXISTING_TICKERS snapshot): {sorted(skipped_existing)}")
     if skipped_ambiguous:
         print(f"WARNING — skipped (flagged ambiguous, not inserted): {sorted(skipped_ambiguous)}")
-    print(f"Companies to insert: {len(kept)}")
+    if skipped_no_arabic_name:
+        print(f"WARNING — skipped (no matching Arabic name found, name_ar is NOT NULL): {sorted(skipped_no_arabic_name)}")
+    print(f"Companies to insert (both name_en and name_ar present): {len(kept)}")
 
     statements = build_insert_sql(kept)
     with open(OUTPUT_SQL_PATH, "w", encoding="utf-8") as f:
@@ -480,11 +631,15 @@ def main() -> None:
             "-- tadawul_companies_insert_statements.sql\n"
             "-- Generated by scripts/discover_tadawul_companies.py — NOT executed against\n"
             "-- Neon by this script.\n"
-            "-- Source: a list the project owner states they fetched live from\n"
-            "-- argaam.com/en on 2026-09-01, pasted into this session as raw text and\n"
-            "-- transcribed here — NOT independently fetched or verified by this script\n"
-            "-- (WebFetch was confirmed fully blocked in the authoring sandbox).\n"
-            "-- name_ar is NULL for every row — not available from this source.\n"
+            "-- Source: two lists (English: argaam.com/en; Arabic:\n"
+            "-- argaam.com/ar/company/companylist) the project owner states they\n"
+            "-- fetched live themselves and pasted into this session as raw text,\n"
+            "-- matched ticker-by-ticker — NOT independently fetched or verified by\n"
+            "-- this script (WebFetch was confirmed fully blocked in the authoring\n"
+            "-- sandbox). Every row below has both name_en and name_ar populated\n"
+            "-- (core.companies.name_ar is NOT NULL); a ticker with no Arabic-name\n"
+            "-- match was excluded, not given an empty/placeholder value — see the\n"
+            "-- script's own console output for which tickers, if any, were excluded.\n"
             "-- Each INSERT is guarded by WHERE NOT EXISTS (core.companies has no real\n"
             "-- UNIQUE/exclusion constraint on ticker to target with ON CONFLICT — verified\n"
             "-- against schema.sql this session).\n"
