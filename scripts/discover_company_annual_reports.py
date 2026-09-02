@@ -99,11 +99,17 @@ import re
 from urllib.parse import urlparse
 
 # ----------------------------------------------------------------------------
-# INPUT — see module docstring's "INPUT" section. Intentionally empty.
-# Shape once populated: {"2010": "https://www.sabic.com/en/investors/...",
-# "1180": "https://www.alahli.com/en-us/investor-relations", ...}
+# INPUT — see module docstring's "INPUT" section. 5 real, project-owner-
+# verified (ticker, ir_page_url) pairs for a live test batch — not
+# discovered or verified by Claude; supplied directly for this run.
 # ----------------------------------------------------------------------------
-COMPANY_IR_PAGES: dict[str, str] = {}
+COMPANY_IR_PAGES: dict[str, str] = {
+    "2222": "https://www.aramco.com/en/investors/annual-report",
+    "2280": "https://www.almarai.com/en/corporate/investor-relations/financial-information",
+    "6004": "https://www.catrion.com/investor-relation",
+    "1120": "https://www.alrajhibank.com.sa/en/About-alrajhi-bank/Investor-Relations",
+    "7010": "https://www.stc.com/content/stcgroupwebsite/sa/en/investors/financial-reports/annual-reports.html",
+}
 
 TARGET_YEAR_MIN = 2015
 YEAR_SEARCH_MIN = 2000   # lower sanity bound for what counts as a "year" at
