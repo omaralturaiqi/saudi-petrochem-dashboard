@@ -1,4 +1,4 @@
-# Saudi Petrochemical Intelligence — Data Foundation
+# راصد السوق السعودي (Saudi Market Monitor) — Data Foundation
 
 A research infrastructure project for Saudi-listed petrochemical companies, built on the principle:
 
