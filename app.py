@@ -17,8 +17,10 @@ import logging
 import requests
 from flask import Flask, render_template_string, abort
 from us_xbrl_api import us_xbrl_bp
+from market_analysis_api import market_analysis_bp
 app = Flask(__name__)
 app.register_blueprint(us_xbrl_bp)
+app.register_blueprint(market_analysis_bp)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("saudi-petrochem-dashboard")
 
@@ -116,6 +118,7 @@ PAGE_TEMPLATE = """
 </head>
 <body>
   <h1>منصة تحليل البتروكيماويات السعودية <span class="badge">للعرض فقط</span></h1>
+  <div><a href="/market-analysis/" style="color:#7dd3fc; text-decoration:none; font-size:13px;">Market Analysis</a></div>
   <div class="subtitle">البيانات مباشرة من قاعدة Neon — بدون تخزين مؤقت، كل تحميل استعلام حي.</div>
 
   <section>
