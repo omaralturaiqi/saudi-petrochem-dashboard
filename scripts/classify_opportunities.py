@@ -138,11 +138,18 @@ def fetch_companies_with_financials() -> list[dict]:
     )
 
 
-def fetch_net_income_rows() -> list[dict]:
+def fetch_net_income_rows(ticker: str | None = None) -> list[dict]:
     """Read-only. All net_income_attributable_to_parent / net_income rows
     for every company that has any — grouped/analyzed in Python by
     compute_earnings_trend(), not in SQL, so the concept-preference logic
-    stays in one testable place."""
+    stays in one testable place.
+
+    ticker: optional filter to a single company (added so this function
+    is reusable for a single-company deep-dive view, e.g.
+    market_analysis_api.py's per-company page, without fetching all
+    253 companies' rows just to look up one). Default None preserves
+    this function's original all-companies behavior exactly — every
+    existing caller (this script's own main()) is unaffected."""
     # NET_INCOME_CONCEPTS_PREFERRED_ORDER's two values are fixed literals
     # this script controls (not user input), so they're inlined directly
     # rather than passed as a $1 array param — Neon's SQL-over-HTTP
@@ -151,13 +158,18 @@ def fetch_net_income_rows() -> list[dict]:
     # established, already-proven pattern (see every other run_query()
     # call in this project).
     concepts_sql_list = ", ".join(f"'{c}'" for c in NET_INCOME_CONCEPTS_PREFERRED_ORDER)
-    return run_query(
+    sql = (
         "SELECT c.ticker, fli.concept, fli.fiscal_year, fli.value_raw "
         "FROM core.financial_line_items fli "
         "JOIN core.companies c ON c.company_id = fli.company_id "
-        f"WHERE fli.concept IN ({concepts_sql_list}) "
-        "ORDER BY c.ticker, fli.concept, fli.fiscal_year;"
+        f"WHERE fli.concept IN ({concepts_sql_list})"
     )
+    params = None
+    if ticker is not None:
+        sql += " AND c.ticker = $1"
+        params = [ticker]
+    sql += " ORDER BY c.ticker, fli.concept, fli.fiscal_year;"
+    return run_query(sql, params)
 
 
 def compute_earnings_trend(rows_for_ticker: list[dict]) -> tuple[str, int | None, str | None]:

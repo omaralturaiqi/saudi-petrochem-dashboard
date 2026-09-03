@@ -35,12 +35,36 @@ DATA — read this before trusting the output:
   yet. This is stated explicitly in the page's subtitle, not just this
   comment, so it's visible to whoever is looking at the numbers.
 
+DEEP-DIVE (this revision): a company search result is no longer just the
+multi-year Abnormal Return table — build_deep_dive() adds, per matched
+ticker: (a) its opportunity classification, ONLY if
+core.financial_line_items has any data for it — reuses
+scripts.classify_opportunities.compute_earnings_trend()/classify()
+directly via a LOCAL (function-scope) import rather than reimplementing
+that logic; (b) the officially-cited "why" text (that concept/year's
+review_notes, falling back to reported_label) shown verbatim with an
+explicit "officially announced by the company itself" attribution, never
+reworded or interpreted; (c) historical "sharp move" cycles — every year
+with |Abnormal Return| > 15%, each honestly flagged whether ANY financial
+data exists for that specific year (never an invented explanation when
+it doesn't); (d) a fixed bilingual disclaimer under every deep-dive block
+stating the classification is not a timing prediction and that most
+companies have no financial data yet. A company with zero
+financial_line_items rows shows ONLY the historical-cycles section plus
+an explicit "no confirmed financial data yet" message — never a silently
+missing section, never a guessed classification.
+
 WHAT THIS FILE DOES NOT DO:
   - Never writes to Neon — every query here is a read-only SELECT.
   - Never touches app.py's or us_xbrl_api.py's own routes, templates, or
     run_query() — this blueprint is fully self-contained, same as
     us_xbrl_api.py is relative to app.py.
   - Never fabricates a translated company name — see pick_display_name().
+  - Never reimplements scripts/classify_opportunities.py's own trend/
+    classification logic — imports and reuses it directly.
+  - Never invents a "why" explanation, or an explanation for a historical
+    sharp-move year with no recorded financial data — both show an
+    honest absence instead.
 """
 from flask import Blueprint, render_template_string, request
 import os
@@ -159,6 +183,120 @@ def pick_display_name(row: dict, lang: str) -> str | None:
     return preferred or fallback
 
 
+def fetch_financial_line_items_for_ticker(ticker: str) -> list[dict]:
+    """Read-only. ALL core.financial_line_items rows for one ticker (every
+    concept, not just net_income) — used by build_deep_dive() for the
+    "why" text (review_notes/reported_label) and to check whether a given
+    year has ANY confirmed financial data at all (for the historical-
+    cycles table's "financial data available?" column). Self-contained
+    within this blueprint, matching its own established run_query()
+    pattern."""
+    return run_query(
+        "SELECT fli.concept, fli.fiscal_year, fli.value_raw, fli.unit, "
+        "fli.reported_label, fli.review_notes, fli.confidence "
+        "FROM core.financial_line_items fli "
+        "JOIN core.companies c ON c.company_id = fli.company_id "
+        "WHERE c.ticker = $1 "
+        "ORDER BY fli.fiscal_year DESC;",
+        [ticker],
+    )
+
+
+# Abnormal Return magnitude above which a year counts as a "sharp move" /
+# historical cycle worth surfacing separately — per this task's own
+# explicit >+15% or <-15% threshold.
+HISTORICAL_CYCLE_THRESHOLD_PCT = 15.0
+
+
+def build_deep_dive(ticker: str, history_rows: list[dict]) -> dict:
+    """Builds one company's full deep-dive block:
+      - classification (earnings trend x Abnormal Return), ONLY if the
+        company has any core.financial_line_items data at all — reuses
+        scripts.classify_opportunities.compute_earnings_trend()/classify()
+        directly (imported, not reimplemented — see the local import
+        below for why it's local, not module-level).
+      - the officially-cited "why" text (review_notes, falling back to
+        reported_label) for the specific (concept, fiscal_year) row the
+        classification's earnings trend was actually computed from — never
+        a different row, never reworded.
+      - historical sharp-move cycles: every year in history_rows with
+        |Abnormal Return| > HISTORICAL_CYCLE_THRESHOLD_PCT, each honestly
+        flagged Yes/No for whether ANY financial_line_items row exists for
+        that specific year — never an invented explanation when the
+        answer is No.
+
+    history_rows: this ticker's own slice of a SEARCH_HISTORY_SQL result
+    (already fetched by the caller for the existing multi-year table) —
+    REUSED here for the classification's Abnormal Return figure too,
+    rather than calling scripts.classify_opportunities.
+    fetch_abnormal_return_for_year() again, which would re-run the exact
+    same query a second time for data already in memory."""
+    financial_rows = fetch_financial_line_items_for_ticker(ticker)
+    has_financial_data = bool(financial_rows)
+
+    classification_info = None
+    why_text = None
+    if has_financial_data:
+        # Local (function-scope) import, not module-level: avoids a
+        # circular import at MODULE LOAD time, since
+        # scripts/classify_opportunities.py itself does
+        # `from market_analysis_api import SEARCH_HISTORY_SQL` at its own
+        # module level. By the time this function is first called (a real
+        # HTTP request), market_analysis_api.py has already fully finished
+        # loading (app.py imports it before any request can arrive), so
+        # classify_opportunities.py's reverse import succeeds cleanly the
+        # first time IT loads, here.
+        from scripts.classify_opportunities import classify, compute_earnings_trend, fetch_net_income_rows
+
+        net_income_rows = fetch_net_income_rows(ticker)
+        trend, latest_year, concept_used = compute_earnings_trend(net_income_rows)
+
+        abnormal_return_pct = None
+        if latest_year is not None:
+            match = next((r for r in history_rows if r.get("fiscal_year") == latest_year), None)
+            if match is not None and match.get("abnormal_return_pct") is not None:
+                abnormal_return_pct = float(match["abnormal_return_pct"])
+
+        classification_value = classify(trend, abnormal_return_pct)
+        classification_info = {
+            "trend": trend, "latest_year": latest_year,
+            "abnormal_return_pct": abnormal_return_pct, "classification": classification_value,
+        }
+
+        if concept_used is not None and latest_year is not None:
+            why_row = next(
+                (r for r in financial_rows if r["concept"] == concept_used and int(r["fiscal_year"]) == latest_year),
+                None,
+            )
+            if why_row:
+                why_text = why_row.get("review_notes") or why_row.get("reported_label")
+
+    financial_years = {int(r["fiscal_year"]) for r in financial_rows}
+    historical_cycles = []
+    for r in history_rows:
+        ar = r.get("abnormal_return_pct")
+        if ar is None:
+            continue
+        ar = float(ar)
+        if abs(ar) > HISTORICAL_CYCLE_THRESHOLD_PCT:
+            historical_cycles.append({
+                "fiscal_year": r["fiscal_year"],
+                "abnormal_return_pct": ar,
+                "has_financial_data": r["fiscal_year"] in financial_years,
+            })
+
+    return {
+        "ticker": ticker,
+        "display_name": history_rows[0].get("display_name") if history_rows else ticker,
+        "sector": history_rows[0].get("sector") if history_rows else None,
+        "has_financial_data": has_financial_data,
+        "classification_info": classification_info,
+        "why_text": why_text,
+        "historical_cycles": historical_cycles,
+        "history_rows": history_rows,
+    }
+
+
 def split_leaderboard(rows: list[dict], limit: int = 10) -> tuple[list[dict], list[dict]]:
     """Pure, offline-testable. `rows` must already be ORDER BY
     abnormal_return_pct DESC (as LEADERBOARD_SQL_2025 itself guarantees) —
@@ -192,6 +330,23 @@ UI_STRINGS = {
         "th_ticker": "Ticker", "th_company": "Company", "th_sector": "Sector",
         "th_stock_return": "Stock Return", "th_index_return": "Index Return (TASI)",
         "th_abnormal_return": "Abnormal Return", "th_fiscal_year": "Fiscal Year",
+        "classification_labels": {
+            "ALREADY_PRICED_IN": "Already Priced In", "POTENTIAL_OPPORTUNITY": "Potential Opportunity",
+            "MOMENTUM_RISK": "Momentum Risk", "CONSISTENT_DECLINE": "Consistent Decline",
+            "INSUFFICIENT_DATA": "Insufficient Data",
+        },
+        "trend_labels": {"UP": "Earnings Up", "DOWN": "Earnings Down", "UNCLEAR": "Unclear"},
+        "why_heading": "Why", "why_attribution": "Officially announced reason from the company itself",
+        "cycles_heading": "Historical Cycles (moves > ±15%)",
+        "cycles_th_year": "Year", "cycles_th_magnitude": "Move Size", "cycles_th_has_data": "Financial Data Available?",
+        "yes": "Yes", "no": "No",
+        "no_financial_data": "No confirmed financial data available for this company yet — full "
+                              "analysis is not currently possible.",
+        "disclaimer": "This classification relies only on the financial and price data currently "
+                       "available, and is not a prediction of the timing of any future price "
+                       "movement. Financial data is not currently available for most companies — "
+                       "full classification is only possible for companies with confirmed "
+                       "financial_line_items data.",
         "footer_1": "Figures are computed live from core.market_prices and core.market_indices "
                      "(TASI, index_code='TASI') — no caching.",
         "footer_2": "Year-start/year-end close prices, requires at least 150 trading days of price "
@@ -216,6 +371,21 @@ UI_STRINGS = {
         "th_ticker": "الرمز", "th_company": "الشركة", "th_sector": "القطاع",
         "th_stock_return": "عائد السهم", "th_index_return": "عائد المؤشر (تاسي)",
         "th_abnormal_return": "العائد الشاذ", "th_fiscal_year": "السنة المالية",
+        "classification_labels": {
+            "ALREADY_PRICED_IN": "مُسعَّر بالفعل", "POTENTIAL_OPPORTUNITY": "فرصة محتملة",
+            "MOMENTUM_RISK": "مخاطرة زخم", "CONSISTENT_DECLINE": "تراجع مستمر",
+            "INSUFFICIENT_DATA": "بيانات غير كافية",
+        },
+        "trend_labels": {"UP": "أرباح صاعدة", "DOWN": "أرباح هابطة", "UNCLEAR": "غير واضح"},
+        "why_heading": "لماذا", "why_attribution": "السبب المُعلَن رسميًا من الشركة نفسها",
+        "cycles_heading": "دورات تاريخية سابقة (تحركات > ±15%)",
+        "cycles_th_year": "السنة", "cycles_th_magnitude": "حجم التحرك", "cycles_th_has_data": "تتوفر بيانات مالية؟",
+        "yes": "نعم", "no": "لا",
+        "no_financial_data": "لا تتوفر بيانات مالية مؤكَّدة لهذي الشركة بعد — التحليل الكامل غير ممكن حاليًا",
+        "disclaimer": "هذا التصنيف يعتمد فقط على البيانات المالية والسعرية المتوفرة حاليًا، وليس "
+                       "تنبؤًا بتوقيت أي حركة سعرية مستقبلية. البيانات المالية غير متوفرة حاليًا "
+                       "لمعظم الشركات — التصنيف الكامل ممكن فقط للشركات ذات بيانات "
+                       "financial_line_items مؤكَّدة.",
         "footer_1": "الأرقام مُحتسَبة مباشرة من core.market_prices وcore.market_indices "
                      "(تاسي، index_code='TASI') — بدون تخزين مؤقت.",
         "footer_2": "أسعار الإغلاق أول/آخر يوم بالسنة، بشرط 150 يوم تداول على الأقل ضمن السنة "
@@ -263,6 +433,21 @@ DASHBOARD_TEMPLATE = """
   .search-form input[type="text"] { background:#0b0d12; border:1px solid #1e222c; color:#e8e8ea; padding:8px 12px; border-radius:4px; font-size:13px; min-width:240px; }
   .search-form button { background:#1c2333; color:#7dd3fc; border:1px solid #2a3346; padding:8px 16px; border-radius:4px; font-size:13px; cursor:pointer; margin-left:8px; }
   [dir="rtl"] .search-form button { margin-left:0; margin-right:8px; }
+  .deep-dive { background:#0e1116; border:1px solid #1e222c; border-radius:8px; padding:20px; margin-bottom:24px; }
+  .deep-dive h3 { font-size:16px; color:#fff; margin:0 0 12px 0; }
+  .deep-dive h4 { font-size:13px; color:#9aa4b2; margin:20px 0 8px 0; }
+  .classification-block { margin-bottom:12px; }
+  .cls-badge { display:inline-block; border-radius:4px; padding:4px 10px; font-size:12px; font-weight:600; margin-right:8px; }
+  .cls-badge-ALREADY_PRICED_IN { background:#1c2c3f; color:#7dd3fc; }
+  .cls-badge-POTENTIAL_OPPORTUNITY { background:#16301f; color:#4ade80; }
+  .cls-badge-MOMENTUM_RISK { background:#3a2a12; color:#fbbf24; }
+  .cls-badge-CONSISTENT_DECLINE { background:#3a1717; color:#f87171; }
+  .cls-badge-INSUFFICIENT_DATA { background:#22242b; color:#8a8f98; }
+  .trend-badge { font-size:12px; color:#9aa4b2; margin-right:8px; }
+  [dir="rtl"] .cls-badge, [dir="rtl"] .trend-badge { margin-right:0; margin-left:8px; }
+  .why-block { background:#12151c; border-radius:6px; padding:12px 14px; margin-bottom:16px; font-size:13px; }
+  .why-block p { margin:6px 0 0 0; color:#c8ccd4; white-space:pre-wrap; }
+  .disclaimer { background:#171412; border:1px solid #2e2418; color:#c9a876; border-radius:6px; padding:12px 14px; font-size:12px; margin:16px 0; }
 </style>
 </head>
 <body>
@@ -323,8 +508,48 @@ DASHBOARD_TEMPLATE = """
     </form>
     {% if q %}
       <h2>{{ t.search_results_heading }}: <span class="ticker">{{ q }}</span></h2>
-      {% if search_results %}
-        {{ return_table(search_results) }}
+      {% if deep_dives %}
+        {% for dd in deep_dives %}
+        <div class="deep-dive">
+          <h3>{{ dd.display_name or dd.ticker }} <span class="ticker">({{ dd.ticker }})</span>{% if dd.sector %} — {{ dd.sector }}{% endif %}</h3>
+
+          {% if dd.has_financial_data %}
+            {% set ci = dd.classification_info %}
+            <div class="classification-block">
+              <span class="cls-badge cls-badge-{{ ci.classification }}">{{ t.classification_labels.get(ci.classification, ci.classification) }}</span>
+              <span class="trend-badge">{{ t.trend_labels.get(ci.trend, ci.trend) }}{% if ci.latest_year %} (FY{{ ci.latest_year }}){% endif %}</span>
+            </div>
+            {% if dd.why_text %}
+            <div class="why-block">
+              <strong>{{ t.why_heading }}</strong> — <em>{{ t.why_attribution }}</em>
+              <p>{{ dd.why_text }}</p>
+            </div>
+            {% endif %}
+          {% else %}
+            <div class="empty">{{ t.no_financial_data }}</div>
+          {% endif %}
+
+          <h4>{{ t.cycles_heading }}</h4>
+          {% if dd.historical_cycles %}
+          <table>
+            <tr><th>{{ t.cycles_th_year }}</th><th>{{ t.cycles_th_magnitude }}</th><th>{{ t.cycles_th_has_data }}</th></tr>
+            {% for cyc in dd.historical_cycles %}
+            <tr>
+              <td class="fiscal-year">{{ cyc.fiscal_year }}</td>
+              <td class="numeric {{ 'neg' if cyc.abnormal_return_pct < 0 else 'pos' }}">{{ cyc.abnormal_return_pct }}%</td>
+              <td>{{ t.yes if cyc.has_financial_data else t.no }}</td>
+            </tr>
+            {% endfor %}
+          </table>
+          {% else %}
+            <div class="empty">{{ t.no_data }}</div>
+          {% endif %}
+
+          <div class="disclaimer">{{ t.disclaimer }}</div>
+
+          {{ return_table(dd.history_rows) }}
+        </div>
+        {% endfor %}
       {% else %}
         <div class="empty">{{ t.no_results }}</div>
       {% endif %}
@@ -358,6 +583,7 @@ def market_analysis_dashboard():
     top10, worst10 = split_leaderboard(rows)
 
     search_results = []
+    deep_dives = []
     if q:
         like_pattern = f"%{q}%"
         # $1 is reused 3 times in SEARCH_HISTORY_SQL (standard PostgreSQL
@@ -367,8 +593,17 @@ def market_analysis_dashboard():
         for r in search_results:
             r["display_name"] = pick_display_name(r, lang)
 
+        # SEARCH_HISTORY_SQL can match more than one ticker for a loose
+        # partial query — group by ticker (preserving first-seen order,
+        # already ticker-then-year-DESC per the query's own ORDER BY) so
+        # each distinct matched company gets its own deep-dive block.
+        rows_by_ticker: dict[str, list[dict]] = {}
+        for r in search_results:
+            rows_by_ticker.setdefault(r["ticker"], []).append(r)
+        deep_dives = [build_deep_dive(ticker, rows) for ticker, rows in rows_by_ticker.items()]
+
     return render_template_string(
         DASHBOARD_TEMPLATE,
         top10=top10, worst10=worst10, q=q, q_suffix=q_suffix,
-        search_results=search_results, lang=lang, t=UI_STRINGS[lang],
+        search_results=search_results, deep_dives=deep_dives, lang=lang, t=UI_STRINGS[lang],
     )
