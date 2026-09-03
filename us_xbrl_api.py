@@ -73,7 +73,7 @@ UI_STRINGS = {
             "HIGH": "High", "MEDIUM": "Medium", "LOW": "Low", "UNRESOLVED": "Unresolved",
         },
         "footer_1": "Every value traces to a real SEC EDGAR 10-K filing. Structurally Unavailable means no matching XBRL concept exists for that company — shown honestly as empty, never defaulted to zero.",
-        "footer_2": "This page is read-only and isolated from the Saudi petrochemical dashboard.",
+        "footer_2": "This page is read-only and isolated from Saudi Market Monitor.",
     },
     "ar": {
         "html_lang": "ar", "html_dir": "rtl",
@@ -93,7 +93,7 @@ UI_STRINGS = {
             "HIGH": "عالية", "MEDIUM": "متوسطة", "LOW": "منخفضة", "UNRESOLVED": "غير محسومة",
         },
         "footer_1": "كل رقم أعلاه يعود لملف تقديم SEC EDGAR حقيقي (10-K). \"غير متاح هيكليًا\" تعني عدم وجود مفهوم XBRL مطابق لهذه الشركة — تُعرَض بأمانة كخانة فارغة، ولا تتحول أبدًا إلى صفر.",
-        "footer_2": "هذه الصفحة للقراءة فقط ومعزولة تمامًا عن لوحة البتروكيماويات السعودية.",
+        "footer_2": "هذه الصفحة للقراءة فقط ومعزولة تمامًا عن راصد السوق السعودي.",
     },
 }
 

@@ -93,7 +93,7 @@ PAGE_TEMPLATE = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>منصة تحليل البتروكيماويات السعودية</title>
+<title>راصد السوق السعودي</title>
 <style>
   body { font-family: "Segoe UI", Tahoma, "Noto Sans Arabic", sans-serif; background:#0b0d12; color:#e8e8ea; margin:0; padding:24px; }
   h1 { font-size: 20px; color:#fff; margin-bottom:4px; }
@@ -117,7 +117,7 @@ PAGE_TEMPLATE = """
 </style>
 </head>
 <body>
-  <h1>منصة تحليل البتروكيماويات السعودية <span class="badge">للعرض فقط</span></h1>
+  <h1>راصد السوق السعودي <span class="badge">للعرض فقط</span></h1>
   <div><a href="/market-analysis/" style="color:#7dd3fc; text-decoration:none; font-size:13px;">Market Analysis</a></div>
   <div class="subtitle">البيانات مباشرة من قاعدة Neon — بدون تخزين مؤقت، كل تحميل استعلام حي.</div>
 
