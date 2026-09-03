@@ -72,6 +72,36 @@ Render Shell):
      is rejected) — same no-download discipline as every other
      discovery script in this project's history.
 
+REFINEMENTS (this revision) — based on a real 5-company Render Shell run
+(Aramco/Almarai/Catrion/Al Rajhi Bank/STC), not hypothetical:
+  1. Al Rajhi Bank returned 183 extracted links — earnings releases, fact
+     sheets, investor presentations, and call transcripts all matched the
+     original .pdf/annual-report/year heuristic, drowning out the actual
+     annual reports. The "extracted" bucket's definition is UNCHANGED
+     (still every >=2015 report-shaped link) — split_annual_report_candidates()
+     additionally partitions it into ANNUAL_REPORT_CANDIDATES (URL or link
+     text matches an annual-report-shaped marker — see
+     ANNUAL_REPORT_COMPACT_MARKER) and OTHER_FINANCIAL_MATERIALS (everything
+     else in "extracted" — kept, printed, never discarded, just lower
+     priority). This is additive: nothing that was findable before is
+     unfindable now.
+  2. Aramco's annual-report page hit a ReadTimeout at the default 30s.
+     EXTENDED_TIMEOUT_TICKERS raises the timeout to 60s for specifically
+     that ticker (not a global default change — every other company still
+     uses DEFAULT_REQUEST_TIMEOUT_SECONDS). A request that still fails at
+     60s now prints an explicit suggestion (suggest_alternate_url() — a
+     heuristic "try the parent page" derived from the URL itself, NOT a
+     second verified/hardcoded URL, and NOT auto-fetched by this script)
+     instead of failing silently.
+  3. STC's extracted links included interactive landing pages (e.g.
+     ".../stc-annual-report-2025/" — no ".pdf" extension, Content-Type
+     text/html) that verify_endpoint_exists() reported as if they were
+     confirmed documents. classify_verification_result() now requires
+     "pdf" in the actual Content-Type for a CONFIRMED_PDF classification;
+     anything else is explicitly NOT_A_DIRECT_PDF — likely interactive
+     landing page, needs manual follow-up — never silently treated as a
+     verified success.
+
 WHAT THIS SCRIPT DELIBERATELY DOES NOT DO:
   - Never invents an IR page URL — COMPANY_IR_PAGES starts empty and
     stays empty until the project owner supplies real, actually-
@@ -122,7 +152,26 @@ WINDOW_CHARS_AFTER = 150   # smaller look-ahead window for the less common
 MAX_ENDPOINTS_TO_VERIFY = 3  # per company — same fixed cap discipline as
                               # every other discovery script this session.
 
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 30
+EXTENDED_REQUEST_TIMEOUT_SECONDS = 60
+# Per-ticker override, not a global default change. Started with "2222"
+# (Aramco) after a real Render Shell run hit a ReadTimeout at the default
+# 30s against aramco.com/en/investors/annual-report — extensible if
+# another company's IR page is later found to need it too.
+EXTENDED_TIMEOUT_TICKERS: set[str] = {"2222"}
+
 REPORT_URL_MARKERS = (".pdf", "annual-report", "annual_report")
+
+# Compact (separator-stripped) marker used to identify the highest-
+# priority "this specifically is an annual report" links, distinct from
+# the broader REPORT_URL_MARKERS bucket (which also matches earnings
+# releases, fact sheets, presentations — anything .pdf near a year).
+# Stripping "-", "_", and whitespace before comparing means ONE marker
+# ("annualreport") covers every pattern this task named: "annual-report",
+# "annual_report", "AnnualReport", "Integrated-Annual-Report" (contains
+# "...annualreport" as a suffix), and "Annual-Report-EN" (contains
+# "annualreport..." as a prefix) — all case-insensitive.
+ANNUAL_REPORT_COMPACT_MARKER = "annualreport"
 
 YEAR_PATTERN = re.compile(r"\b(20\d{2})\b")
 LINK_PATTERN = re.compile(r'<a\b[^>]*?\bhref\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</a>',
@@ -153,6 +202,16 @@ def _looks_like_report_link(url: str, link_text: str) -> bool:
         return True
     normalized_text = re.sub(r"[-_]", " ", link_text.lower())
     return "annual report" in normalized_text
+
+
+def _looks_like_annual_report(url: str, link_text: str) -> bool:
+    """Pure, offline-testable. Stricter than _looks_like_report_link():
+    identifies specifically an ANNUAL report link (vs. an earnings
+    release, fact sheet, presentation, or transcript that also happens
+    to be a dated PDF) — see ANNUAL_REPORT_COMPACT_MARKER for why a
+    single compact marker covers every pattern this task named."""
+    compact = re.sub(r"[-_\s]", "", f"{url} {link_text}".lower())
+    return ANNUAL_REPORT_COMPACT_MARKER in compact
 
 
 def _years_in_range(text: str) -> list[tuple[int, int]]:
@@ -244,7 +303,10 @@ def extract_year_report_pairs(html_text: str, base_url: str) -> dict:
             prev_link_end=prev_link_end, next_link_start=next_link_start,
         )
         resolved_url = urljoin(base_url, href)
-        entry = {"year": year, "url": resolved_url, "raw_href": href}
+        entry = {
+            "year": year, "url": resolved_url, "raw_href": href,
+            "is_annual_report_candidate": _looks_like_annual_report(href, link_text),
+        }
 
         if year is None:
             unmatched.append({"url": resolved_url, "raw_href": href})
@@ -256,12 +318,48 @@ def extract_year_report_pairs(html_text: str, base_url: str) -> dict:
     return {"extracted": extracted, "excluded_pre_2015": excluded_pre_2015, "unmatched": unmatched}
 
 
-def fetch_ir_page(url: str) -> dict:
-    """ONE GET request, read-only, browser-like headers."""
+def split_annual_report_candidates(extracted: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Pure, offline-testable. Splits the already-"extracted" (year >=
+    TARGET_YEAR_MIN) bucket into ANNUAL_REPORT_CANDIDATES (highest
+    priority — is_annual_report_candidate True) and
+    OTHER_FINANCIAL_MATERIALS (everything else in "extracted" — earnings
+    releases, fact sheets, presentations, transcripts; kept and printed,
+    never discarded, just lower priority). Purely a presentation-level
+    refinement of the existing "extracted" bucket — the set of links
+    counted as "extracted" is unchanged from before this revision."""
+    candidates = [e for e in extracted if e["is_annual_report_candidate"]]
+    other = [e for e in extracted if not e["is_annual_report_candidate"]]
+    return candidates, other
+
+
+def suggest_alternate_url(url: str) -> str | None:
+    """Pure, offline-testable. Heuristic ONLY: suggests trying the parent
+    path (one segment shorter) instead of the specific page that failed
+    — e.g. ".../investors/annual-report" -> ".../investors/" — NOT a
+    verified real URL, and never fetched automatically by this script;
+    printed only as a manual-follow-up suggestion when a request still
+    fails at the extended timeout. Returns None if the path has nothing
+    shorter to suggest (already at or near the domain root)."""
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    remaining = path.strip("/")
+    if "/" not in remaining and remaining != "":
+        return f"{parsed.scheme}://{parsed.netloc}/"
+    if remaining == "":
+        return None
+    parent_path = path.rsplit("/", 1)[0]
+    return f"{parsed.scheme}://{parsed.netloc}{parent_path}/"
+
+
+def fetch_ir_page(url: str, timeout: int = DEFAULT_REQUEST_TIMEOUT_SECONDS) -> dict:
+    """ONE GET request, read-only, browser-like headers. timeout defaults
+    to DEFAULT_REQUEST_TIMEOUT_SECONDS; discover_for_company() passes
+    EXTENDED_REQUEST_TIMEOUT_SECONDS for tickers in
+    EXTENDED_TIMEOUT_TICKERS only — every other company is unaffected."""
     import requests
 
     try:
-        resp = requests.get(url, headers=BROWSER_LIKE_HEADERS, timeout=30)
+        resp = requests.get(url, headers=BROWSER_LIKE_HEADERS, timeout=timeout)
     except Exception as e:
         return {"url": url, "error": f"{type(e).__name__}: {e}"}
     return {
@@ -308,7 +406,24 @@ def verify_endpoint_exists(url: str) -> dict:
         except Exception as e:
             result["fallback_get_error"] = f"{type(e).__name__}: {e}"
 
+    result["classification"] = classify_verification_result(result)
     return result
+
+
+def classify_verification_result(v: dict) -> str:
+    """Pure, offline-testable. A prior revision reported any HTTP 200 as
+    if it confirmed a real PDF — STC's live run showed this is wrong: an
+    interactive landing page (e.g. ".../stc-annual-report-2025/", no
+    .pdf extension) returns 200 with Content-Type text/html, not a PDF.
+    "pdf" must actually appear in the Content-Type for CONFIRMED_PDF;
+    anything else (wrong content-type, a failed request) is explicitly
+    NOT_A_DIRECT_PDF, never silently treated as a verified success."""
+    if v.get("http_status") is None:
+        return "VERIFICATION_FAILED"
+    content_type = (v.get("content_type") or "").lower()
+    if "pdf" in content_type:
+        return "CONFIRMED_PDF"
+    return "NOT_A_DIRECT_PDF — likely interactive landing page, needs manual follow-up"
 
 
 def discover_for_company(ticker: str, ir_page_url: str) -> dict:
@@ -317,9 +432,15 @@ def discover_for_company(ticker: str, ir_page_url: str) -> dict:
     print(f"IR page: {ir_page_url}")
     print("=" * 78)
 
-    page = fetch_ir_page(ir_page_url)
+    timeout = EXTENDED_REQUEST_TIMEOUT_SECONDS if ticker in EXTENDED_TIMEOUT_TICKERS else DEFAULT_REQUEST_TIMEOUT_SECONDS
+    if timeout != DEFAULT_REQUEST_TIMEOUT_SECONDS:
+        print(f"(using extended timeout: {timeout}s — ticker {ticker} is in EXTENDED_TIMEOUT_TICKERS)")
+    page = fetch_ir_page(ir_page_url, timeout=timeout)
     if page.get("error"):
-        print(f"REQUEST FAILED: {page['error']}")
+        print(f"REQUEST FAILED (timeout={timeout}s): {page['error']}")
+        alternate = suggest_alternate_url(ir_page_url)
+        if alternate:
+            print(f"SUGGESTION (heuristic, NOT auto-fetched, NOT a verified URL — try manually): {alternate}")
         print("=" * 78)
         return {"ticker": ticker, "page": page, "extracted": [], "excluded_pre_2015": [], "unmatched": [], "verified": []}
 
@@ -330,9 +451,14 @@ def discover_for_company(ticker: str, ir_page_url: str) -> dict:
         return {"ticker": ticker, "page": page, "extracted": [], "excluded_pre_2015": [], "unmatched": [], "verified": []}
 
     pairs = extract_year_report_pairs(page["html_text"], page["final_url"])
+    annual_report_candidates, other_financial_materials = split_annual_report_candidates(pairs["extracted"])
 
-    print(f"\nEXTRACTED (year >= {TARGET_YEAR_MIN}, {len(pairs['extracted'])}):")
-    for e in sorted(pairs["extracted"], key=lambda x: -x["year"]):
+    print(f"\nANNUAL_REPORT_CANDIDATES (highest priority, {len(annual_report_candidates)}):")
+    for e in sorted(annual_report_candidates, key=lambda x: -x["year"]):
+        print(f"  {e['year']}: {e['url']}")
+    print(f"\nOTHER_FINANCIAL_MATERIALS (year >= {TARGET_YEAR_MIN} but not annual-report-shaped — kept, "
+          f"lower priority, {len(other_financial_materials)}):")
+    for e in sorted(other_financial_materials, key=lambda x: -x["year"]):
         print(f"  {e['year']}: {e['url']}")
     print(f"\nEXCLUDED_PRE_{TARGET_YEAR_MIN} (year < {TARGET_YEAR_MIN}, reported not dropped, {len(pairs['excluded_pre_2015'])}):")
     for e in sorted(pairs["excluded_pre_2015"], key=lambda x: -x["year"]):
@@ -341,10 +467,12 @@ def discover_for_company(ticker: str, ir_page_url: str) -> dict:
     for u in pairs["unmatched"]:
         print(f"  {u['url']}")
 
-    to_verify = pairs["extracted"][:MAX_ENDPOINTS_TO_VERIFY]
+    # Verification budget goes to ANNUAL_REPORT_CANDIDATES first (highest
+    # priority), then any remaining slots to OTHER_FINANCIAL_MATERIALS.
+    to_verify = (annual_report_candidates + other_financial_materials)[:MAX_ENDPOINTS_TO_VERIFY]
     if len(pairs["extracted"]) > MAX_ENDPOINTS_TO_VERIFY:
         print(f"\nNOTE: {len(pairs['extracted'])} extracted links found; verifying only the first "
-              f"{MAX_ENDPOINTS_TO_VERIFY}.")
+              f"{MAX_ENDPOINTS_TO_VERIFY} (annual-report candidates prioritized).")
 
     print(f"\nVERIFYING {len(to_verify)} EXTRACTED LINK(S) (existence only — no download, no save)")
     verified = []
@@ -357,7 +485,12 @@ def discover_for_company(ticker: str, ir_page_url: str) -> dict:
                 print(f"    {k}: {val}")
 
     print("=" * 78)
-    return {"ticker": ticker, "page": page, **pairs, "verified": verified}
+    return {
+        "ticker": ticker, "page": page, **pairs,
+        "annual_report_candidates": annual_report_candidates,
+        "other_financial_materials": other_financial_materials,
+        "verified": verified,
+    }
 
 
 def main() -> None:
