@@ -27,12 +27,26 @@ USAGE:
         # DIAGNOSTIC ONLY: process just pages 50-60 (1-based, inclusive) of
         # the same document, to isolate which page a failure occurs on.
         # The PDF is still downloaded and opened normally either way.
-    python3 scripts/dry_run_extract.py --period-type Q1 --fiscal-quarter 1
-        # Labels the run/candidates as Q1 — does NOT change extraction
-        # behavior. Quarter-specific column detection is not implemented
-        # (see ingestion/extract_dry_run.py's own docstring for why); this
-        # still binds against bare-year header columns exactly as an FY
-        # request would.
+    python3 scripts/dry_run_extract.py --period-type Q2 --fiscal-quarter 2
+        # Period-aware column selection IS implemented (see
+        # ingestion/extract_dry_run.py's own docstring — "PERIOD-BLOCK
+        # DISAMBIGUATION"). When a table block's year-header row has more
+        # than one column sharing the same bare year (e.g. a discrete
+        # three-month figure and a cumulative six-month/YTD figure both
+        # labeled "2026"), the parser uses a detected period-label row
+        # above the header (e.g. "For the three-month period ..." / "For
+        # the six-month period ...") plus x-position clustering to
+        # distinguish which column the requested period_type refers to:
+        # Q1/Q2/Q3/Q4 select the "three-month" block, H1 selects the
+        # "six-month" block. This has been verified against a real
+        # quarterly filing for Q2 and H1 specifically (see
+        # ingestion/extract_dry_run.py's docstring and
+        # tests/test_extract_dry_run.py's TestPeriodBlockDisambiguation*
+        # classes); the Q1/Q3/Q4 mapping exists in code but has not been
+        # verified against real Q1/Q3/Q4 filing bytes. A table with only
+        # one period block per year (e.g. a normal annual report, or any
+        # document where no period-label row is found) is unaffected —
+        # FY/annual single-block extraction behaves exactly as before.
 """
 from __future__ import annotations
 
@@ -83,10 +97,17 @@ def run(
     print(f"Period type  : {period_type}"
           + (f" (fiscal_quarter={fiscal_quarter})" if fiscal_quarter is not None else ""))
     if period_type != "FY":
-        print("  NOTE: quarter-specific column detection is NOT implemented (see "
-              "ingestion/extract_dry_run.py's own docstring) — this run will bind "
-              "against bare-year header columns exactly as an FY request would; "
-              "period_type/fiscal_quarter are recorded as labels only.")
+        print("  NOTE: period-aware column selection is implemented (see "
+              "ingestion/extract_dry_run.py's own docstring, 'PERIOD-BLOCK "
+              "DISAMBIGUATION') — for a table block whose year-header row has "
+              "more than one column sharing this fiscal year, this run will use "
+              "detected period-label text to select the correct block: Q1-Q4 "
+              "select the 'three-month' block, H1 selects the 'six-month' "
+              "block. Verified against real filing bytes for Q2/H1 specifically; "
+              "Q1/Q3/Q4 mappings exist in code but are not yet verified against "
+              "real Q1/Q3/Q4 filing bytes. A table with only one period block "
+              "for this year (e.g. a normal annual table) is unaffected by "
+              "period_type and resolves the same as an FY request.")
     if start_page is not None or end_page is not None:
         print(f"Page range   : {start_page if start_page is not None else 1}"
               f"-{end_page if end_page is not None else '(last)'} (diagnostic subset)")
