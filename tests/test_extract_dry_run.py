@@ -22,13 +22,29 @@ from reportlab.pdfgen import canvas
 
 from ingestion.extract_dry_run import (
     KNOWN_CONCEPT_KEYS,
+    VALID_PERIOD_TYPES,
     PdfBytesInvalid,
+    _detect_period_label_clusters_above,
+    _nearest_period_label,
+    _select_requested_period_value,
+    _split_row_into_period_label_clusters,
     extract_from_bytes,
     verify_pdf_bytes,
 )
 from scripts.dry_run_extract import build_arg_parser, run as script_run
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Real, official SABIC Agri-Nutrients (ticker 2020) interim filing for the
+# three-month and six-month periods ended 30 June 2026 — fetched via
+# argaamplus.s3.amazonaws.com/4d858ed5-a579-4051-bb24-58dffd007b1d.pdf
+# (sabic.com/sabic-agrinutrients.com/saudiexchange.sa are all blocked from
+# this sandbox; this S3 mirror was not). Its SHA-256 is asserted in the
+# regression test below both as an integrity check on this fixture file
+# and as documentation of exactly which real filing produced the expected
+# figures asserted there.
+REAL_QUARTERLY_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "real_pdfs" / "sabic_agrinutrients_q2_2026.pdf"
+REAL_QUARTERLY_FIXTURE_SHA256 = "28aec831b8fbafc31a269fce710db980a524bedf77ec3d01cc11e48ab796d61e"
 DATA_RAW_ROOT = REPO_ROOT / "data" / "raw"
 
 
@@ -725,6 +741,479 @@ class TestNoFilesystemPersistence(unittest.TestCase):
         pdf_bytes = _build_fixture_pdf_bytes()
         with patch("builtins.open", side_effect=guarded_open):
             extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+
+
+class TestQuarterlyPeriodMetadata(unittest.TestCase):
+    """Proves the approved, minimal quarterly-ingestion interface change:
+    period_type/fiscal_quarter are accepted, validated, and propagated
+    onto every candidate and the returned summary dict — as REQUEST
+    LABELS ONLY. No quarter-specific column-header detection exists (see
+    TestQuarterlyHeaderDetectionNotImplemented below for why, and the
+    explicit stop this session reported instead of inventing one) — a
+    "Q1" request must bind against bare-year header columns EXACTLY like
+    an "FY" request for the same document/fiscal_year, proven here by
+    running both and asserting byte-for-byte-equal binding results."""
+
+    def test_default_period_type_is_fy_unchanged_from_before(self):
+        # Backward compatibility: omitting period_type/fiscal_quarter
+        # entirely must behave identically to every pre-existing call
+        # site in this test file (all of which call extract_from_bytes()
+        # with no period_type/fiscal_quarter argument at all).
+        pdf_bytes = _build_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        self.assertEqual(result["period_type"], "FY")
+        self.assertIsNone(result["fiscal_quarter"])
+        for c in result["candidates"]:
+            self.assertEqual(c["period_type"], "FY")
+            self.assertIsNone(c["fiscal_quarter"])
+
+    def test_q1_request_propagates_metadata_onto_every_candidate_and_summary(self):
+        pdf_bytes = _build_two_column_fixture_pdf_bytes()
+        result = extract_from_bytes(
+            pdf_bytes, ticker="2010", fiscal_year=2024,
+            period_type="Q1", fiscal_quarter=1,
+        )
+        self.assertEqual(result["period_type"], "Q1")
+        self.assertEqual(result["fiscal_quarter"], 1)
+        self.assertTrue(result["candidates"], "fixture must still produce candidates")
+        for c in result["candidates"]:
+            self.assertEqual(c["period_type"], "Q1")
+            self.assertEqual(c["fiscal_quarter"], 1)
+
+    def test_q1_request_binds_identically_to_fy_request_same_document(self):
+        # The core honesty check: requesting a quarter must NOT silently
+        # change binding behavior, since no quarter-column detection
+        # exists. Compare every field except the period_type/
+        # fiscal_quarter labels themselves — everything else (value_col1/
+        # value_col2, requested_year_value, year_resolved,
+        # mapped_year_values, raw_numeric_tokens, table_index, warnings)
+        # must be identical between an FY and a Q1 request against the
+        # exact same bytes/fiscal_year.
+        pdf_bytes = _build_two_column_fixture_pdf_bytes()
+        fy_result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        q1_result = extract_from_bytes(
+            pdf_bytes, ticker="2010", fiscal_year=2024,
+            period_type="Q1", fiscal_quarter=1,
+        )
+        self.assertEqual(len(fy_result["candidates"]), len(q1_result["candidates"]))
+        for fy_c, q1_c in zip(fy_result["candidates"], q1_result["candidates"]):
+            fy_stripped = {k: v for k, v in fy_c.items() if k not in ("period_type", "fiscal_quarter")}
+            q1_stripped = {k: v for k, v in q1_c.items() if k not in ("period_type", "fiscal_quarter")}
+            self.assertEqual(
+                fy_stripped, q1_stripped,
+                "requesting period_type='Q1' must not change ANY binding/extraction "
+                "behavior versus period_type='FY' for the same document — only the "
+                "label differs, since quarter-column detection is not implemented",
+            )
+
+    def test_invalid_period_type_rejected(self):
+        pdf_bytes = _build_fixture_pdf_bytes()
+        with self.assertRaises(ValueError):
+            extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024, period_type="Q5")
+
+    def test_invalid_fiscal_quarter_rejected(self):
+        pdf_bytes = _build_fixture_pdf_bytes()
+        with self.assertRaises(ValueError):
+            extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024, fiscal_quarter=5)
+
+    def test_fiscal_quarter_not_cross_validated_against_period_type(self):
+        # Documented, deliberate design choice (see extract_from_bytes()'s
+        # own docstring): fiscal_quarter=2 with period_type="FY" is
+        # ACCEPTED, not rejected — mirrors schema.sql's own independently-
+        # nullable/CHECKed columns, not a compound constraint.
+        pdf_bytes = _build_fixture_pdf_bytes()
+        result = extract_from_bytes(
+            pdf_bytes, ticker="2010", fiscal_year=2024,
+            period_type="FY", fiscal_quarter=2,
+        )
+        self.assertEqual(result["period_type"], "FY")
+        self.assertEqual(result["fiscal_quarter"], 2)
+
+    def test_all_valid_period_types_accepted(self):
+        pdf_bytes = _build_fixture_pdf_bytes()
+        for pt in VALID_PERIOD_TYPES:
+            result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024, period_type=pt)
+            self.assertEqual(result["period_type"], pt)
+
+
+class TestQuarterlyDoesNotBreakTableIndexOrP0Fixes(unittest.TestCase):
+    """Proves the two hard non-goals of this task: (1) table_index/
+    duplicate-block logic is untouched by a quarterly-labeled request,
+    even on a document with FY-shaped year-header tables (the only shape
+    this engine can detect) appearing more than once; (2) the P0 value-
+    binding fixes from 5f6791f (no positional fallback, unresolved
+    mapping stays unresolved, raw_numeric_tokens always preserved, an
+    unbound token never becomes authoritative) hold identically under a
+    quarterly-labeled request."""
+
+    def test_duplicate_table_blocks_unaffected_by_period_type_label(self):
+        pdf_bytes = _build_duplicate_table_fixture_pdf_bytes()
+        fy_result = extract_from_bytes(pdf_bytes, ticker="2010", fiscal_year=2024)
+        q1_result = extract_from_bytes(
+            pdf_bytes, ticker="2010", fiscal_year=2024,
+            period_type="Q1", fiscal_quarter=1,
+        )
+        fy_table_indexes = sorted({c["table_index"] for c in fy_result["candidates"]})
+        q1_table_indexes = sorted({c["table_index"] for c in q1_result["candidates"]})
+        self.assertEqual(fy_table_indexes, q1_table_indexes)
+        self.assertEqual(len(fy_table_indexes), 2, "fixture defines exactly 2 distinct table blocks")
+        # The duplicate-table-block warning must still fire identically.
+        fy_dup_warned = [c for c in fy_result["candidates"]
+                          if any("distinct table" in w for w in c["warnings"])]
+        q1_dup_warned = [c for c in q1_result["candidates"]
+                          if any("distinct table" in w for w in c["warnings"])]
+        self.assertEqual(len(fy_dup_warned), len(q1_dup_warned))
+        self.assertTrue(fy_dup_warned, "the duplicate-table-block warning must still fire")
+
+    def test_p0_stray_unbound_token_behavior_unaffected_by_period_type_label(self):
+        pdf_bytes = _build_stray_note_number_fixture_pdf_bytes()
+        result = extract_from_bytes(
+            pdf_bytes, ticker="2010", fiscal_year=2024,
+            period_type="Q1", fiscal_quarter=1,
+        )
+        equity_candidates = [c for c in result["candidates"] if c["concept"] == "total_equity"]
+        self.assertEqual(len(equity_candidates), 1)
+        c = equity_candidates[0]
+
+        # Same P0 assertions as TestP0ValueBindingFixes, now under a
+        # quarterly-labeled request — must hold identically.
+        self.assertTrue(c["year_resolved"])
+        self.assertEqual(c["requested_year_value"], 300.00)
+        self.assertNotIn(6.15, c["mapped_year_values"].values())
+        stray_entries = [t for t in c["raw_numeric_tokens"] if t["value"] == 6.15]
+        self.assertEqual(len(stray_entries), 1, "the stray token must still be preserved, not deleted")
+        self.assertIsNone(stray_entries[0]["bound_year"], "must still be recorded as unbound, not guessed")
+        self.assertTrue(
+            any("did not align with any detected year column" in w for w in c["warnings"])
+        )
+
+    def test_p0_no_positional_fallback_unaffected_by_period_type_label(self):
+        # Reuses the no-year-header fixture: even under a quarterly label,
+        # a document with NO detectable year-header row must still leave
+        # year_resolved False and value_col1/value_col2 unset — never a
+        # positional guess, regardless of what period was requested.
+        pdf_bytes = _build_fixture_pdf_bytes()
+        result = extract_from_bytes(
+            pdf_bytes, ticker="2010", fiscal_year=2024,
+            period_type="Q1", fiscal_quarter=1,
+        )
+        self.assertTrue(result["candidates"])
+        for c in result["candidates"]:
+            self.assertFalse(c["year_resolved"])
+            self.assertIsNone(c["value_col1"])
+            self.assertIsNone(c["value_col2"])
+            self.assertEqual(c["confidence"], "LOW")
+
+
+class TestQuarterlyHeaderDetectionNotImplemented(unittest.TestCase):
+    """UPDATED — the blocker this class originally recorded (no real
+    quarterly financial-report PDF/header available anywhere) has since
+    been resolved: a real SABIC Agri-Nutrients Q2 2026 interim filing was
+    obtained via argaamplus.s3.amazonaws.com (sabic.com/
+    sabic-agrinutrients.com/saudiexchange.sa remain blocked from this
+    sandbox — that S3 mirror was not) and used to build
+    TestPeriodBlockDisambiguation* below, which supersedes this class for
+    the two phrases actually observed ("three-month"/"six-month").
+
+    What remains genuinely NOT implemented, and is still recorded here
+    rather than silently having no test for it: any period-label wording
+    OTHER than those two exact phrases — e.g. "nine-month"/"twelve-month"
+    cumulative labels, an "H2" filing's own wording (never observed), or
+    a header shape entirely unlike "For the <N>-month period ended
+    <date>" (e.g. a literal "Q1 2025" column caption). Per explicit
+    instruction, none of that is guessed or implemented without
+    inspecting a real example first."""
+
+    def test_skipped_pending_additional_real_period_label_wording(self):
+        self.skipTest(
+            "BLOCKED (narrowed from the original, now-resolved blocker): 'three-month'/"
+            "'six-month' period-label detection IS implemented and tested against a real "
+            "filing (see TestPeriodBlockDisambiguation* below). Still blocked: any OTHER "
+            "period-label wording (nine-month/twelve-month cumulative labels, a real H2 "
+            "filing's own wording, or a differently-shaped header e.g. a literal 'Q1 2025' "
+            "column caption) — none of these has been observed in a real filing this "
+            "session, so none is guessed or implemented. This test exists to keep that "
+            "narrower remaining gap visible, not to silently omit it."
+        )
+
+
+class TestPeriodLabelHelperFunctions(unittest.TestCase):
+    """Pure, offline, no-PDF unit tests for the 4 new helper functions
+    this fix adds: _split_row_into_period_label_clusters(),
+    _detect_period_label_clusters_above(), _nearest_period_label(), and
+    _select_requested_period_value(). Exercises them directly against
+    hand-built word/row data (not a rendered PDF) for fast, precise
+    coverage of the exact collision this fix targets, independent of any
+    real or synthetic PDF fixture."""
+
+    def _word(self, text, x0, x1):
+        return {"text": text, "x0": x0, "x1": x1, "top": 0.0}
+
+    def test_split_row_finds_the_widest_gap(self):
+        # Mirrors the real header's shape: "For the three-month period"
+        # (tightly spaced words) ... a wide gap ... "For the six-month
+        # period" (tightly spaced words).
+        row = [
+            self._word("For", 100, 120), self._word("the", 124, 140),
+            self._word("three-month", 144, 210), self._word("period", 214, 260),
+            self._word("For", 400, 420), self._word("the", 424, 440),
+            self._word("six-month", 444, 500), self._word("period", 504, 550),
+        ]
+        clusters = _split_row_into_period_label_clusters(row)
+        self.assertEqual(len(clusters), 2)
+        self.assertEqual(clusters[0]["text"], "for the three-month period")
+        self.assertEqual(clusters[1]["text"], "for the six-month period")
+        self.assertEqual(clusters[0]["x0"], 100)
+        self.assertEqual(clusters[0]["x1"], 260)
+        self.assertEqual(clusters[1]["x0"], 400)
+        self.assertEqual(clusters[1]["x1"], 550)
+
+    def test_split_row_fewer_than_two_words_returns_empty(self):
+        self.assertEqual(_split_row_into_period_label_clusters([]), [])
+        self.assertEqual(_split_row_into_period_label_clusters([self._word("x", 0, 10)]), [])
+
+    def test_detect_period_label_clusters_above_finds_the_real_observed_row(self):
+        # Mirrors the real filing's exact 3-row structure: period-label
+        # row, then a "Notes ended ..." row (no keyword match — must be
+        # skipped over, not mistaken for the label row), then the bare-
+        # year header row itself (index passed in as header_row_idx).
+        primary_rows = [
+            [self._word("For", 100, 120), self._word("three-month", 144, 210), self._word("period", 214, 260),
+             self._word("For", 400, 420), self._word("six-month", 444, 500), self._word("period", 504, 550)],
+            [self._word("Notes", 100, 130), self._word("ended", 134, 170),
+             self._word("ended", 400, 436)],
+            [self._word("2026", 190, 220), self._word("2025", 260, 290),
+             self._word("2026", 490, 520), self._word("2025", 560, 590)],
+        ]
+        clusters = _detect_period_label_clusters_above(primary_rows, header_row_idx=2)
+        self.assertEqual(len(clusters), 2)
+        labels = {c["period_label"] for c in clusters}
+        self.assertEqual(labels, {"three-month", "six-month"})
+
+    def test_detect_period_label_clusters_above_returns_empty_when_no_keyword_row_found(self):
+        # A normal annual-report-style block: nothing but a bare-year
+        # header row, nothing resembling a period-label row above it —
+        # must return [] (preserving today's exact pre-fix behavior).
+        primary_rows = [
+            [self._word("Total", 50, 80), self._word("revenue", 84, 130)],
+            [self._word("2024", 190, 220), self._word("2023", 260, 290)],
+        ]
+        clusters = _detect_period_label_clusters_above(primary_rows, header_row_idx=1)
+        self.assertEqual(clusters, [])
+
+    def test_nearest_period_label_inside_range(self):
+        clusters = [
+            {"x0": 100, "x1": 260, "period_label": "three-month"},
+            {"x0": 400, "x1": 550, "period_label": "six-month"},
+        ]
+        self.assertEqual(_nearest_period_label(clusters, 205.0), "three-month")
+        self.assertEqual(_nearest_period_label(clusters, 475.0), "six-month")
+
+    def test_nearest_period_label_outside_every_range_picks_closest(self):
+        clusters = [
+            {"x0": 100, "x1": 260, "period_label": "three-month"},
+            {"x0": 400, "x1": 550, "period_label": "six-month"},
+        ]
+        self.assertEqual(_nearest_period_label(clusters, 300.0), "three-month")  # 40 away vs 100 away
+        self.assertEqual(_nearest_period_label(clusters, 370.0), "six-month")    # 30 away vs 110 away
+
+    def test_nearest_period_label_empty_clusters_returns_none(self):
+        self.assertIsNone(_nearest_period_label([], 200.0))
+
+    def test_select_requested_period_value_unambiguous_single_match_ignores_period_type(self):
+        # Exactly 1 match for the year — resolved regardless of
+        # period_type, INCLUDING when period_label is None (the normal
+        # single-period-block/annual case) — this is what preserves
+        # byte-for-byte pre-fix behavior for every non-ambiguous table.
+        mapped = {(2024, None): 300.0, (2023, None): 280.0}
+        self.assertEqual(_select_requested_period_value(mapped, 2024, "FY"), 300.0)
+        self.assertEqual(_select_requested_period_value(mapped, 2024, "Q2"), 300.0)  # period_type irrelevant here
+
+    def test_select_requested_period_value_ambiguous_resolves_via_mapped_period_type(self):
+        mapped = {
+            (2026, "three-month"): 712192.0, (2025, "three-month"): 1266945.0,
+            (2026, "six-month"): 2080959.0, (2025, "six-month"): 2432338.0,
+        }
+        self.assertEqual(_select_requested_period_value(mapped, 2026, "Q2"), 712192.0)
+        self.assertEqual(_select_requested_period_value(mapped, 2026, "H1"), 2080959.0)
+        self.assertEqual(_select_requested_period_value(mapped, 2025, "Q3"), 1266945.0)  # any QN -> three-month
+
+    def test_select_requested_period_value_ambiguous_unmapped_period_type_refuses_to_guess(self):
+        mapped = {(2026, "three-month"): 712192.0, (2026, "six-month"): 2080959.0}
+        # FY and H2 have no _PERIOD_TYPE_TO_PERIOD_LABEL entry — must
+        # refuse (None), never silently pick either block.
+        self.assertIsNone(_select_requested_period_value(mapped, 2026, "FY"))
+        self.assertIsNone(_select_requested_period_value(mapped, 2026, "H2"))
+
+    def test_select_requested_period_value_no_match_for_year_returns_none(self):
+        mapped = {(2026, "three-month"): 712192.0}
+        self.assertIsNone(_select_requested_period_value(mapped, 2099, "Q2"))
+
+
+def _build_period_block_fixture_pdf_bytes() -> bytes:
+    """Builds a synthetic, real, single-page PDF mirroring the ACTUAL
+    structure observed in the real SABIC Agri-Nutrients Q2 2026 filing's
+    income statement (not invented beyond it): a period-label row ("For
+    the three-month period" / "For the six-month period"), a bare-year
+    header row with the SAME years repeated per block (2025/2024 under
+    each), and one data row (Revenue) with 4 numeric columns:
+    Q2 2025 | Q2 2024 | H1 2025 | H1 2024 — the exact shape named in this
+    task's own test requirements."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(792, 612))
+    c.setFont("Helvetica", 10)
+    # Title line spanning (near) the full page width, exactly as a real
+    # statement header does — this is what keeps _detect_column_boundary()
+    # from mistaking the horizontal gap between the three-month and
+    # six-month blocks below for a genuine two-column page gutter (the
+    # real filing's page is filled with comparable full-width content;
+    # without this line the two blocks would be >30pt apart with nothing
+    # else on the page, which would falsely trigger the two-column split
+    # this module's OWN _detect_column_boundary() correctly performs for
+    # actual two-column pages — see TestCoordinateAwareExtraction).
+    c.drawString(50, 580, "Interim condensed statement of income for the six-month period ended 30 June (SAR '000)")
+    c.drawString(150, 560, "For the three-month period")
+    c.drawString(450, 560, "For the six-month period")
+    c.drawString(160, 540, "2025")
+    c.drawString(220, 540, "2024")
+    c.drawString(460, 540, "2025")
+    c.drawString(520, 540, "2024")
+    c.drawString(50, 520, "Total revenue")
+    c.drawString(160, 520, "100.00")   # Q2 2025 (three-month)
+    c.drawString(220, 520, "90.00")    # Q2 2024 (three-month)
+    c.drawString(460, 520, "250.00")   # H1 2025 (six-month, YTD)
+    c.drawString(520, 520, "230.00")   # H1 2024 (six-month, YTD)
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+class TestPeriodBlockDisambiguationSyntheticFixture(unittest.TestCase):
+    """Proves period-block disambiguation end-to-end against a synthetic,
+    from-scratch PDF built to mirror the real observed 4-column shape
+    (Q2 2025 | Q2 2024 | H1 2025 | H1 2024) — independent of the real PDF
+    fixture (which requires the checked-in binary file to be present;
+    this test always runs)."""
+
+    def test_q2_selects_three_month_block(self):
+        pdf_bytes = _build_period_block_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2020", fiscal_year=2025, period_type="Q2", fiscal_quarter=2)
+        revenue = [c for c in result["candidates"] if c["concept"] == "revenue"][0]
+        self.assertTrue(revenue["year_resolved"])
+        self.assertEqual(revenue["requested_year_value"], 100.00)
+        self.assertEqual(
+            revenue["mapped_period_year_values"],
+            {"2025:three-month": 100.00, "2024:three-month": 90.00,
+             "2025:six-month": 250.00, "2024:six-month": 230.00},
+        )
+
+    def test_h1_selects_six_month_block(self):
+        pdf_bytes = _build_period_block_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2020", fiscal_year=2025, period_type="H1")
+        revenue = [c for c in result["candidates"] if c["concept"] == "revenue"][0]
+        self.assertTrue(revenue["year_resolved"])
+        self.assertEqual(revenue["requested_year_value"], 250.00)
+
+    def test_comparative_year_also_disambiguated_correctly(self):
+        # The comparative year (2024) is ALSO ambiguous across both
+        # blocks — proves this isn't specific to the "current" year.
+        pdf_bytes = _build_period_block_fixture_pdf_bytes()
+        q2_result = extract_from_bytes(pdf_bytes, ticker="2020", fiscal_year=2024, period_type="Q2", fiscal_quarter=2)
+        h1_result = extract_from_bytes(pdf_bytes, ticker="2020", fiscal_year=2024, period_type="H1")
+        q2_revenue = [c for c in q2_result["candidates"] if c["concept"] == "revenue"][0]
+        h1_revenue = [c for c in h1_result["candidates"] if c["concept"] == "revenue"][0]
+        self.assertEqual(q2_revenue["requested_year_value"], 90.00)
+        self.assertEqual(h1_revenue["requested_year_value"], 230.00)
+
+    def test_unmapped_period_type_does_not_guess(self):
+        # FY has no _PERIOD_TYPE_TO_PERIOD_LABEL entry — against this
+        # genuinely ambiguous document, it must stay unresolved rather
+        # than silently picking either block.
+        pdf_bytes = _build_period_block_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2020", fiscal_year=2025, period_type="FY")
+        revenue = [c for c in result["candidates"] if c["concept"] == "revenue"][0]
+        self.assertFalse(revenue["year_resolved"])
+        self.assertIsNone(revenue["requested_year_value"])
+
+    def test_raw_numeric_tokens_preserves_all_four_values_with_bound_period_label(self):
+        # The audit trail must show ALL four numbers, each correctly
+        # tagged with bound_year AND the new bound_period_label field —
+        # regardless of which one ends up selected as requested_year_value.
+        pdf_bytes = _build_period_block_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2020", fiscal_year=2025, period_type="Q2", fiscal_quarter=2)
+        revenue = [c for c in result["candidates"] if c["concept"] == "revenue"][0]
+        tokens = {(t["value"], t["bound_year"], t["bound_period_label"]) for t in revenue["raw_numeric_tokens"]}
+        self.assertEqual(
+            tokens,
+            {
+                (100.00, 2025, "three-month"), (90.00, 2024, "three-month"),
+                (250.00, 2025, "six-month"), (230.00, 2024, "six-month"),
+            },
+        )
+
+    def test_legacy_mapped_year_values_field_unchanged_construction(self):
+        # mapped_year_values (the pre-fix, legacy field) must still exist,
+        # still be year-only-keyed, and still reflect the pre-fix
+        # first-wins collapsing behavior exactly — proving this revision
+        # did not remove or reshape it, only added mapped_period_year_values
+        # alongside it.
+        pdf_bytes = _build_period_block_fixture_pdf_bytes()
+        result = extract_from_bytes(pdf_bytes, ticker="2020", fiscal_year=2025, period_type="Q2", fiscal_quarter=2)
+        revenue = [c for c in result["candidates"] if c["concept"] == "revenue"][0]
+        self.assertIn(2025, revenue["mapped_year_values"])
+        self.assertIn(2024, revenue["mapped_year_values"])
+        self.assertIsInstance(list(revenue["mapped_year_values"].keys())[0], int)
+
+
+class TestPeriodBlockDisambiguationRealPDF(unittest.TestCase):
+    """Real-bytes regression test against the actual SABIC Agri-Nutrients
+    Q2 2026 filing obtained and diagnosed this session (see module-level
+    REAL_QUARTERLY_FIXTURE_PATH/REAL_QUARTERLY_FIXTURE_SHA256). Skips
+    (does not fail) if the fixture file is not present in this checkout —
+    it is a real, ~1.15 MB downloaded filing, not yet committed as of
+    this revision (a separate, explicit decision — see this task's own
+    final report)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not REAL_QUARTERLY_FIXTURE_PATH.exists():
+            raise unittest.SkipTest(
+                f"real PDF fixture not present at {REAL_QUARTERLY_FIXTURE_PATH} — "
+                "this test requires the actual downloaded SABIC Agri-Nutrients Q2 2026 "
+                "filing (SHA-256 " + REAL_QUARTERLY_FIXTURE_SHA256 + "); skipping rather "
+                "than failing, since whether to commit this real binary into the repo "
+                "is a separate, not-yet-made decision."
+            )
+        cls.pdf_bytes = REAL_QUARTERLY_FIXTURE_PATH.read_bytes()
+
+    def test_fixture_integrity_sha256(self):
+        self.assertEqual(hashlib.sha256(self.pdf_bytes).hexdigest(), REAL_QUARTERLY_FIXTURE_SHA256)
+
+    def test_q2_selects_three_month_gross_profit(self):
+        result = extract_from_bytes(self.pdf_bytes, ticker="2020", fiscal_year=2026, period_type="Q2", fiscal_quarter=2)
+        gp = [c for c in result["candidates"] if c["concept"] == "gross_profit"][0]
+        self.assertTrue(gp["year_resolved"])
+        self.assertEqual(gp["requested_year_value"], 712192.0)  # real, printed Q2 2026 gross profit
+
+    def test_h1_selects_six_month_gross_profit(self):
+        result = extract_from_bytes(self.pdf_bytes, ticker="2020", fiscal_year=2026, period_type="H1")
+        gp = [c for c in result["candidates"] if c["concept"] == "gross_profit"][0]
+        self.assertTrue(gp["year_resolved"])
+        self.assertEqual(gp["requested_year_value"], 2080959.0)  # real, printed H1 2026 (YTD) gross profit
+
+    def test_fy_request_against_this_ambiguous_real_document_does_not_guess(self):
+        result = extract_from_bytes(self.pdf_bytes, ticker="2020", fiscal_year=2026, period_type="FY")
+        gp = [c for c in result["candidates"] if c["concept"] == "gross_profit"][0]
+        self.assertFalse(gp["year_resolved"])
+        self.assertIsNone(gp["requested_year_value"])
+
+    def test_comparative_year_2025_also_disambiguated_correctly(self):
+        q2_result = extract_from_bytes(self.pdf_bytes, ticker="2020", fiscal_year=2025, period_type="Q2", fiscal_quarter=2)
+        h1_result = extract_from_bytes(self.pdf_bytes, ticker="2020", fiscal_year=2025, period_type="H1")
+        q2_gp = [c for c in q2_result["candidates"] if c["concept"] == "gross_profit"][0]
+        h1_gp = [c for c in h1_result["candidates"] if c["concept"] == "gross_profit"][0]
+        self.assertEqual(q2_gp["requested_year_value"], 1266945.0)  # real, printed Q2 2025 comparative
+        self.assertEqual(h1_gp["requested_year_value"], 2432338.0)  # real, printed H1 2025 comparative
 
 
 if __name__ == "__main__":

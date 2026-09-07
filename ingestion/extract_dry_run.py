@@ -86,6 +86,49 @@ register_source_document()/load_facts() (still unimplemented TODOs in
 ingestion/load_historical.py) and is not wired to acquire_one_report()/
 acquire_reports() — this module performs no acquisition itself; the
 caller is responsible for obtaining pdf_bytes (see scripts/dry_run_extract.py).
+
+QUARTERLY (introduced in one revision, corrected in the next) —
+extract_from_bytes() accepts period_type/fiscal_quarter and records them
+onto every candidate and the returned summary dict (see its own
+docstring for the exact contract). The revision that first added these
+parameters was REQUEST-LABELING METADATA ONLY, written before any real
+quarterly filing had been obtained and inspected — at that time every
+entry in every *_SOURCE_REGISTRY (ingestion/load_historical.py) was
+document_type="annual_report" and data/raw/ held zero actual PDF bytes.
+
+PERIOD-BLOCK DISAMBIGUATION (this revision): a real SABIC Agri-Nutrients
+Q2 2026 interim filing was subsequently obtained (argaamplus.s3.
+amazonaws.com/4d858ed5-a579-4051-bb24-58dffd007b1d.pdf, SHA-256
+28aec831b8fbafc31a269fce710db980a524bedf77ec3d01cc11e48ab796d61e) and
+run through this module unmodified, which surfaced a real, concrete bug:
+its income statement's year-header row reads "2026 2025 2026 2025" — the
+bare-year detector (_is_year_token) already recognized these tokens
+correctly (nothing wrong with header RECOGNITION), but the same year
+legitimately appears twice — once for a discrete three-month (quarterly)
+figure, once for the cumulative six-month (year-to-date) figure — and
+the pre-existing mapped_year_values.setdefault(year, value) aggregation
+silently collapsed both into one dict entry, always keeping whichever
+was encountered first regardless of the requested period_type. This
+revision adds _detect_period_label_clusters_above()/
+_nearest_period_label()/_select_requested_period_value(): a table
+block's year-header row is now checked for a period-label row above it
+containing "three-month"/"six-month" (the ONLY two phrases actually
+observed — no generic multi-quarter header format is invented for
+period-label wording never seen, e.g. H2), each detected year-column is
+tagged with which period-block it belongs to, and requested_year_value
+is resolved from the resulting (year, period_label)-keyed mapping — with
+an explicit, honest "cannot disambiguate -> stays unresolved" fallback
+whenever period_type has no mapping for it or the mapped label isn't
+among what was actually found, per every table block. A normal, single-
+period-block document (annual reports, and any table where no period-
+label row is found) resolves BYTE-FOR-BYTE IDENTICALLY to before this
+fix — see _select_requested_period_value()'s own docstring for why.
+
+table_index/duplicate-block logic and the P0 value-binding fixes
+(5f6791f: no positional fallback, unresolved mapping stays unresolved,
+raw_numeric_tokens always preserved — now with one additive field,
+bound_period_label — an unbound token never becomes authoritative) are
+completely unchanged by this revision.
 """
 from __future__ import annotations
 
@@ -118,6 +161,13 @@ KNOWN_CONCEPT_KEYS = frozenset({
     "net_income_total",
 })
 
+# Mirrors schema.sql's financial_line_items.period_type CHECK domain
+# exactly (also independently mirrored in scripts/ingest_financial_line_
+# item.py's own PERIOD_TYPES tuple — NOT imported from there, to keep
+# this module's only cross-file dependency on parser.py, per its own
+# established self-contained design; see that module's docstring).
+VALID_PERIOD_TYPES = ("FY", "Q1", "Q2", "Q3", "Q4", "H1", "H2")
+
 PDF_MAGIC_BYTES = b"%PDF-"
 
 # --- coordinate-aware extraction tuning constants -------------------------
@@ -135,6 +185,170 @@ _COLUMN_BOUNDARY_MARGIN_FRACTION = 0.10  # ignore the outer 10% of page
 _YEAR_BIND_MAX_DISTANCE = 40.0  # points; a numeric token further than this
                                   # from every known year column's x-center
                                   # is left unmapped rather than force-bound.
+
+# --- period-block disambiguation (added for quarterly ingestion) ----------
+# Fixes a real, evidence-based bug found running this module against an
+# actual SABIC Agri-Nutrients Q2 2026 interim filing (argaamplus.s3.
+# amazonaws.com/4d858ed5-a579-4051-bb24-58dffd007b1d.pdf, SHA-256
+# 28aec831b8fbafc31a269fce710db980a524bedf77ec3d01cc11e48ab796d61e): its
+# income statement's year-header row reads "2026 2025 2026 2025" — the
+# SAME bare year repeated once for a discrete three-month (quarterly)
+# figure and once for the cumulative six-month (half-year, year-to-date)
+# figure. Per-token x-distance binding already correctly identifies each
+# number's own physical column, but the pre-existing
+# mapped_year_values.setdefault(year, value) aggregation silently
+# collapsed both "2026" columns into one dict key, always keeping
+# whichever was encountered first — regardless of what period_type was
+# actually requested. This section adds period-block labeling ONLY for
+# the two phrases actually observed above that real header row ("For the
+# three-month period ended 30 June (Unaudited)" / "For the six-month
+# period ended 30 June (Unaudited)") — it deliberately does NOT invent a
+# generic quarterly header format for period-label wording never
+# observed (e.g. H2, or a nine-month/annual label).
+_PERIOD_LABEL_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "three-month": ("three-month", "three month"),
+    "six-month": ("six-month", "six month"),
+}
+# Maps a requested period_type to the period-label text it should match
+# when a table block's year-header row has more than one column sharing
+# the same bare year. Q1-Q4 each individually report a discrete quarter
+# as a "three-month" figure (per the real filing); H1 reports the first
+# half as a "six-month" figure. H2 and FY have no observed period-label
+# wording in any filing inspected this session, so they are deliberately
+# left unmapped — see _select_requested_period_value()'s "refuse rather
+# than guess" fallback for what happens when period_type has no entry
+# here.
+_PERIOD_TYPE_TO_PERIOD_LABEL: dict[str, str] = {
+    "Q1": "three-month", "Q2": "three-month", "Q3": "three-month", "Q4": "three-month",
+    "H1": "six-month",
+}
+_PERIOD_LABEL_ROW_LOOKBACK = 3  # how many rows above a detected bare-year
+                                  # header row to search for a period-label
+                                  # row — the real filing has it 2 rows
+                                  # above (a "Notes ended 30 June
+                                  # (Unaudited)" row sits directly between
+                                  # them); 3 gives one row of slack without
+                                  # scanning back over the whole page.
+
+
+def _split_row_into_period_label_clusters(row_words: list[dict]) -> list[dict]:
+    """Pure, offline-testable. Splits ONE row's words into (at most) two
+    x-position clusters by the single widest horizontal gap between
+    consecutive words (sorted by x0) — mirrors _detect_column_boundary()'s
+    own "widest whitespace corridor" philosophy, scoped to one row instead
+    of a whole page, since exactly 2 side-by-side period-label phrases is
+    what the real observed filing's header shows (not a generalized N-way
+    split). Returns [] if the row has fewer than 2 words (nothing to
+    split — e.g. a row belonging to a normal, single-period-block/annual
+    table, which never reaches this function at all — see
+    _detect_period_label_clusters_above()'s own keyword-match gate).
+    Each returned cluster: {"x0": ..., "x1": ..., "text": "..." (lowercase,
+    joined)}."""
+    if len(row_words) < 2:
+        return []
+    sorted_words = sorted(row_words, key=lambda w: w["x0"])
+    gaps = [
+        (sorted_words[i + 1]["x0"] - sorted_words[i]["x1"], i)
+        for i in range(len(sorted_words) - 1)
+    ]
+    _widest_gap, split_at = max(gaps, key=lambda g: g[0])
+    clusters = []
+    for group in (sorted_words[: split_at + 1], sorted_words[split_at + 1:]):
+        if not group:
+            continue
+        clusters.append({
+            "x0": min(w["x0"] for w in group),
+            "x1": max(w["x1"] for w in group),
+            "text": " ".join(w["text"] for w in group).lower(),
+        })
+    return clusters
+
+
+def _detect_period_label_clusters_above(primary_rows: list[list[dict]], header_row_idx: int) -> list[dict]:
+    """Pure given primary_rows/header_row_idx (no I/O). Searches up to
+    _PERIOD_LABEL_ROW_LOOKBACK rows immediately above the detected
+    bare-year header row (nearest first) for one whose own text contains
+    at least one of _PERIOD_LABEL_KEYWORDS' phrases, splits THAT row into
+    x-position clusters via _split_row_into_period_label_clusters(), and
+    tags each cluster with whichever keyword (if any) its own text
+    contains. Returns [] if no such row is found within the lookback
+    window — callers then treat every year column in this table block as
+    period_label=None, i.e. EXACTLY today's pre-existing behavior (a
+    normal annual-report-style single-period-block table is never
+    affected by this function at all)."""
+    lookback_start = max(0, header_row_idx - _PERIOD_LABEL_ROW_LOOKBACK)
+    for row_idx in range(header_row_idx - 1, lookback_start - 1, -1):
+        row = primary_rows[row_idx]
+        row_text_lower = " ".join(w["text"] for w in row).lower()
+        if not any(kw in row_text_lower for kws in _PERIOD_LABEL_KEYWORDS.values() for kw in kws):
+            continue
+        clusters = _split_row_into_period_label_clusters(row)
+        for cluster in clusters:
+            cluster["period_label"] = next(
+                (label for label, kws in _PERIOD_LABEL_KEYWORDS.items() if any(kw in cluster["text"] for kw in kws)),
+                None,
+            )
+        return clusters
+    return []
+
+
+def _nearest_period_label(clusters: list[dict], x_center: float) -> str | None:
+    """Pure. Returns the period_label of whichever cluster's x-range the
+    given x_center falls within (or is nearest to, if outside every
+    cluster's range) — None if clusters is empty (the normal, unambiguous
+    single-period-block case)."""
+    if not clusters:
+        return None
+
+    def _distance(cluster: dict) -> float:
+        if cluster["x0"] <= x_center <= cluster["x1"]:
+            return 0.0
+        return min(abs(x_center - cluster["x0"]), abs(x_center - cluster["x1"]))
+
+    return min(clusters, key=_distance).get("period_label")
+
+
+def _select_requested_period_value(
+    mapped_period_year_values: dict[tuple[int, str | None], float],
+    fiscal_year: int,
+    period_type: str,
+) -> float | None:
+    """Pure, offline-testable. Selects the single value that actually
+    corresponds to the requested (fiscal_year, period_type) — never
+    guesses when genuinely ambiguous.
+
+    matches = every value recorded for this fiscal_year, keyed by
+    whichever period_label (if any) its column carried.
+      - 0 matches: not resolvable — unchanged from before this fix
+        (year_resolved stays False).
+      - Exactly 1 match: unambiguous — returned as-is, REGARDLESS of its
+        period_label (including None). This is what makes a normal
+        single-period-block document (annual reports, and the common
+        case where a fiscal_year happens to appear only once) resolve
+        byte-for-byte identically to before this fix.
+      - More than 1 match (the real, observed case: the same bare year
+        legitimately repeated across >1 period-length blocks on one
+        header row): only resolvable if period_type maps
+        (_PERIOD_TYPE_TO_PERIOD_LABEL) to a label that is ACTUALLY among
+        the matches found — never a positional/first-wins guess. If
+        period_type has no mapping (e.g. FY, H2 — not evidenced by any
+        filing inspected this session) or its mapped label isn't among
+        the matches, returns None — preserving the existing "unresolved"
+        semantics rather than picking one arbitrarily.
+    """
+    matches = {
+        period_label: value
+        for (year, period_label), value in mapped_period_year_values.items()
+        if year == fiscal_year
+    }
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    target_label = _PERIOD_TYPE_TO_PERIOD_LABEL.get(period_type)
+    if target_label is not None and target_label in matches:
+        return matches[target_label]
+    return None
 
 
 class PdfBytesInvalid(ValueError):
@@ -248,6 +462,8 @@ def extract_from_bytes(
     fiscal_year: int,
     start_page: int | None = None,
     end_page: int | None = None,
+    period_type: str = "FY",
+    fiscal_quarter: int | None = None,
 ) -> dict:
     """READ-ONLY, in-memory, coordinate-aware extraction. Never writes a
     file (uses io.BytesIO, not a temp file), never imports any database
@@ -262,28 +478,78 @@ def extract_from_bytes(
     page.extract_words() call for them), so the full document's extracted
     content is never held in memory regardless of range size.
 
+    period_type / fiscal_quarter — REQUEST-LABELING METADATA ONLY in this
+    revision, read this before assuming quarterly extraction actually
+    works: period_type (one of VALID_PERIOD_TYPES, mirroring schema.sql's
+    financial_line_items.period_type CHECK domain) and fiscal_quarter
+    (None, or 1-4, mirroring its fiscal_quarter CHECK) are recorded onto
+    every candidate and the returned summary dict so a caller can label
+    what period was ASKED FOR. They do NOT change this function's actual
+    column-detection/binding behavior in any way — that logic still only
+    recognizes bare-year header rows (_is_year_token, e.g. "2024") for
+    BOTH annual and quarterly requests, exactly as before this revision.
+    Real quarter-column detection (e.g. a "Q1 2025"-style header, or
+    side-by-side current-quarter/comparative-quarter/YTD columns as real
+    quarterly filings commonly use) is explicitly NOT implemented here —
+    per explicit instruction, no such format is guessed or invented
+    without inspecting a real quarterly financial-report PDF, and none
+    exists anywhere in this repository, in any COMPANY_SOURCE_REGISTRIES
+    entry (every registered document_type is "annual_report" — verified
+    via grep before writing this code), or is fetchable from this
+    sandbox (no network access). A caller requesting period_type="Q1"
+    today gets EXACTLY the same year-column-binding result an annual
+    request would for the same fiscal_year — only the label differs.
+    fiscal_quarter is not cross-validated against period_type (e.g.
+    fiscal_quarter=2 with period_type="FY" is accepted, not rejected) —
+    mirroring schema.sql's own design, where period_type and
+    fiscal_quarter/fiscal_half are independently nullable/CHECKed
+    columns, not a compound constraint.
+
     Raises ValueError if the requested range is invalid for this document
-    (e.g. start_page > end_page, or end_page beyond the real page count).
+    (e.g. start_page > end_page, or end_page beyond the real page count),
+    or if period_type is not in VALID_PERIOD_TYPES, or if fiscal_quarter
+    is given and not an integer 1-4.
 
     Returns:
       {
-        "ticker": ..., "fiscal_year": ..., "document_sha256": ...,
-        "page_count": ..., "candidates": [ {...}, ... ],
+        "ticker": ..., "fiscal_year": ..., "period_type": ...,
+        "fiscal_quarter": ..., "document_sha256": ..., "page_count": ...,
+        "candidates": [ {...}, ... ],
       }
 
     Each candidate dict:
-      ticker, fiscal_year, statement_type, concept, concept_known,
-      reported_label, value_col1, value_col2 (both None unless
-      year_resolved is True — see year_resolved below), requested_year_value,
-      year_resolved (bool — True iff requested_year_value is not None; a
-      candidate should not be treated as a valid fiscal_year extraction
-      unless this is True), mapped_year_values, raw_numeric_tokens (list of
-      {text, x0, x1, value, bound_year} for EVERY numeric token found in
-      the matched window, regardless of whether it ended up bound to a
-      year column — full evidence, never filtered out), table_index,
+      ticker, fiscal_year, period_type, fiscal_quarter (the requested-
+      period labels echoed onto every candidate — not independently
+      re-detected per candidate; period_type IS however actually used, as
+      of this revision, to disambiguate requested_year_value whenever a
+      table block has more than one column sharing the same bare year —
+      see _select_requested_period_value()), statement_type, concept,
+      concept_known, reported_label, value_col1, value_col2 (both None
+      unless year_resolved is True — see year_resolved below),
+      requested_year_value, year_resolved (bool — True iff
+      requested_year_value is not None; a candidate should not be treated
+      as a valid fiscal_year extraction unless this is True),
+      mapped_year_values (LEGACY, year-only-keyed, unchanged construction
+      — kept for backward compatibility, no longer the resolution
+      source), mapped_period_year_values (the disambiguated ground truth
+      added by this revision: {"{year}:{period_label_or_empty}": value},
+      e.g. {"2026:three-month": 712192.0, "2026:six-month": 2080959.0}
+      when a table block genuinely has more than one period-length block
+      for the same year — string-keyed, not tuple-keyed, so this stays
+      JSON-serializable), raw_numeric_tokens (list of {text, x0, x1,
+      value, bound_year, bound_period_label} for EVERY numeric token
+      found in the matched window, regardless of whether it ended up
+      bound to a year column — full evidence, never filtered out;
+      bound_period_label is additive as of this revision, always None for
+      a token that isn't bound to any year column), table_index,
       source_page, source_row_top, source_word_positions, currency, unit,
       extraction_method, confidence, raw_text, warnings (list[str]).
     """
+    if period_type not in VALID_PERIOD_TYPES:
+        raise ValueError(f"period_type must be one of {VALID_PERIOD_TYPES}, got {period_type!r}")
+    if fiscal_quarter is not None and fiscal_quarter not in (1, 2, 3, 4):
+        raise ValueError(f"fiscal_quarter must be None or an integer 1-4, got {fiscal_quarter!r}")
+
     verify_pdf_bytes(pdf_bytes)
     document_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
 
@@ -341,11 +607,18 @@ def extract_from_bytes(
                 primary_rows = _group_words_into_rows(primary_words)
 
                 table_index = 0
-                # (year:int, x0:float, x1:float) for the CURRENT table
-                # block only — reset whenever a new year-header row is
-                # detected; a numeric value is bound to whichever entry's
-                # x-center it is nearest to, within _YEAR_BIND_MAX_DISTANCE.
-                year_columns: list[tuple[int, float, float]] = []
+                # (year:int, x0:float, x1:float, period_label:str|None) for
+                # the CURRENT table block only — reset whenever a new
+                # year-header row is detected; a numeric value is bound to
+                # whichever entry's x-center it is nearest to, within
+                # _YEAR_BIND_MAX_DISTANCE. period_label is None unless a
+                # period-label row (e.g. "For the three-month period ...")
+                # was found immediately above this header row — see
+                # _detect_period_label_clusters_above() — which is what
+                # lets two columns sharing the SAME bare year (a discrete-
+                # quarter figure and a cumulative year-to-date figure) stay
+                # distinguishable instead of colliding.
+                year_columns: list[tuple[int, float, float, str | None]] = []
                 page_candidates: list[dict] = []
 
                 for row_idx, row in enumerate(primary_rows):
@@ -354,8 +627,12 @@ def extract_from_bytes(
                         # A year-header row — starts a new table block.
                         # Never itself scanned as a data row.
                         table_index += 1
+                        period_label_clusters = _detect_period_label_clusters_above(primary_rows, row_idx)
                         year_columns = [
-                            (int(w["text"].rstrip(",")), w["x0"], w["x1"])
+                            (
+                                int(w["text"].rstrip(",")), w["x0"], w["x1"],
+                                _nearest_period_label(period_label_clusters, _word_x_center(w)),
+                            )
                             for w in row_year_tokens
                         ]
                         continue
@@ -399,32 +676,61 @@ def extract_from_bytes(
                         # is identifiable and excluded from being treated as
                         # a value, even on a row where OTHER tokens did
                         # bind successfully.
+                        # mapped_year_values: UNCHANGED, legacy field —
+                        # still keyed by year alone, still built via
+                        # setdefault() exactly as before this revision, so
+                        # every existing caller/test reading it sees
+                        # byte-for-byte identical values. It is no longer
+                        # the source of requested_year_value/year_resolved
+                        # (see mapped_period_year_values below) — kept only
+                        # for backward compatibility as a simplified,
+                        # potentially-collapsed at-a-glance view.
                         mapped_year_values: dict[int, float] = {}
+                        # mapped_period_year_values: the disambiguated
+                        # ground truth added by this revision, keyed by
+                        # (year, period_label) — never collapses two
+                        # columns that share a bare year but belong to
+                        # different period-length blocks (the real bug
+                        # this fix addresses). period_label is None for
+                        # every entry in a normal single-period-block
+                        # table (annual reports, and any table where
+                        # _detect_period_label_clusters_above() found
+                        # nothing) — in that case this dict is exactly
+                        # equivalent to mapped_year_values.
+                        mapped_period_year_values: dict[tuple[int, str | None], float] = {}
                         raw_numeric_tokens: list[dict] = []
                         for w, v in parsed:
                             bound_year = None
+                            bound_period_label = None
                             if year_columns:
                                 wc = _word_x_center(w)
-                                nearest_year, nx0, nx1 = min(
+                                nearest_year, nx0, nx1, nearest_period_label = min(
                                     year_columns, key=lambda yc: abs(((yc[1] + yc[2]) / 2.0) - wc)
                                 )
                                 if abs(((nx0 + nx1) / 2.0) - wc) <= _YEAR_BIND_MAX_DISTANCE:
                                     bound_year = nearest_year
+                                    bound_period_label = nearest_period_label
                                     mapped_year_values.setdefault(nearest_year, v)
+                                    mapped_period_year_values.setdefault((nearest_year, nearest_period_label), v)
                             # Full evidence preserved unconditionally — every
                             # token found is reported here regardless of
                             # whether it ended up bound to a year column,
                             # per the explicit "do not silently delete
-                            # evidence" requirement.
+                            # evidence" requirement. bound_period_label is
+                            # an ADDITIVE field (new in this revision) —
+                            # every previously-existing key is unchanged.
                             raw_numeric_tokens.append({
                                 "text": w["text"],
                                 "x0": round(w["x0"], 1),
                                 "x1": round(w["x1"], 1),
                                 "value": v,
                                 "bound_year": bound_year,
+                                "bound_period_label": bound_period_label,
                             })
 
-                        requested_year_value = mapped_year_values.get(fiscal_year)
+                        requested_year_value = _select_requested_period_value(
+                            mapped_period_year_values, fiscal_year, period_type
+                        )
                         year_resolved = requested_year_value is not None
 
                         warnings: list[str] = []
@@ -504,6 +810,8 @@ def extract_from_bytes(
                         page_candidates.append({
                             "ticker": ticker,
                             "fiscal_year": fiscal_year,
+                            "period_type": period_type,
+                            "fiscal_quarter": fiscal_quarter,
                             "statement_type": stmt_type,
                             "concept": concept,
                             "concept_known": concept_known,
@@ -513,6 +821,10 @@ def extract_from_bytes(
                             "requested_year_value": requested_year_value,
                             "year_resolved": year_resolved,
                             "mapped_year_values": dict(mapped_year_values),
+                            "mapped_period_year_values": {
+                                f"{y}:{pl if pl is not None else ''}": v
+                                for (y, pl), v in mapped_period_year_values.items()
+                            },
                             "raw_numeric_tokens": raw_numeric_tokens,
                             "table_index": table_index,
                             "currency": "SAR",
@@ -584,6 +896,8 @@ def extract_from_bytes(
     return {
         "ticker": ticker,
         "fiscal_year": fiscal_year,
+        "period_type": period_type,
+        "fiscal_quarter": fiscal_quarter,
         "document_sha256": document_sha256,
         "page_count": page_count,
         "candidates": candidates,

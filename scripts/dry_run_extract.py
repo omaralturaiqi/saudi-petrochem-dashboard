@@ -27,6 +27,12 @@ USAGE:
         # DIAGNOSTIC ONLY: process just pages 50-60 (1-based, inclusive) of
         # the same document, to isolate which page a failure occurs on.
         # The PDF is still downloaded and opened normally either way.
+    python3 scripts/dry_run_extract.py --period-type Q1 --fiscal-quarter 1
+        # Labels the run/candidates as Q1 — does NOT change extraction
+        # behavior. Quarter-specific column detection is not implemented
+        # (see ingestion/extract_dry_run.py's own docstring for why); this
+        # still binds against bare-year header columns exactly as an FY
+        # request would.
 """
 from __future__ import annotations
 
@@ -37,7 +43,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ingestion.extract_dry_run import PdfBytesInvalid, extract_from_bytes, verify_pdf_bytes
+from ingestion.extract_dry_run import (
+    VALID_PERIOD_TYPES,
+    PdfBytesInvalid,
+    extract_from_bytes,
+    verify_pdf_bytes,
+)
 
 # The verified SABIC FY2024 URL currently in
 # SABIC_SOURCE_REGISTRY[("2010", 2024)] (ingestion/load_historical.py).
@@ -58,6 +69,8 @@ def run(
     fiscal_year: int,
     start_page: int | None = None,
     end_page: int | None = None,
+    period_type: str = "FY",
+    fiscal_quarter: int | None = None,
 ) -> dict | None:
     import requests  # local import — keeps module import itself side-effect-free
 
@@ -67,6 +80,13 @@ def run(
     print(f"URL          : {url}")
     print(f"Ticker       : {ticker}")
     print(f"Fiscal year  : {fiscal_year}")
+    print(f"Period type  : {period_type}"
+          + (f" (fiscal_quarter={fiscal_quarter})" if fiscal_quarter is not None else ""))
+    if period_type != "FY":
+        print("  NOTE: quarter-specific column detection is NOT implemented (see "
+              "ingestion/extract_dry_run.py's own docstring) — this run will bind "
+              "against bare-year header columns exactly as an FY request would; "
+              "period_type/fiscal_quarter are recorded as labels only.")
     if start_page is not None or end_page is not None:
         print(f"Page range   : {start_page if start_page is not None else 1}"
               f"-{end_page if end_page is not None else '(last)'} (diagnostic subset)")
@@ -129,6 +149,7 @@ def run(
         result = extract_from_bytes(
             pdf_bytes, ticker=ticker, fiscal_year=fiscal_year,
             start_page=start_page, end_page=end_page,
+            period_type=period_type, fiscal_quarter=fiscal_quarter,
         )
     except Exception as e:
         print(f"EXTRACTION FAILED: {type(e).__name__}: {e}")
@@ -198,13 +219,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "(default: the document's last page — i.e. the whole document, "
              "identical to omitting this flag)",
     )
+    cli.add_argument(
+        "--period-type", choices=VALID_PERIOD_TYPES, default="FY",
+        help="Requested reporting period (mirrors schema.sql's period_type CHECK "
+             "domain). REQUEST-LABELING ONLY — quarter-specific column detection "
+             "is not implemented; a non-FY value still binds against bare-year "
+             "header columns exactly as FY would, just recorded under this label.",
+    )
+    cli.add_argument(
+        "--fiscal-quarter", type=int, choices=[1, 2, 3, 4], default=None,
+        help="Requested fiscal quarter (1-4), recorded as a label alongside "
+             "--period-type — not cross-validated against it, not used to alter "
+             "extraction behavior in this revision.",
+    )
     return cli
 
 
 def main():
     cli = build_arg_parser()
     args = cli.parse_args()
-    run(args.url, args.ticker, args.fiscal_year, args.start_page, args.end_page)
+    run(
+        args.url, args.ticker, args.fiscal_year, args.start_page, args.end_page,
+        args.period_type, args.fiscal_quarter,
+    )
 
 
 if __name__ == "__main__":
